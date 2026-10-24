@@ -83,7 +83,7 @@ yap video.mp4 --json --word-timestamps -o transcript.json
 `yap listen` transcribes system audio in real time — anything playing on your computer.
 
 ```
-USAGE: yap listen [--locale <locale>] [--censor] [--txt] [--srt] [--vtt] [--json] [--max-length <max-length>] [--word-timestamps] [--fast] [--no-fast] [--vocabulary <vocabulary>] [--engine <engine>] [--whisper-model <whisper-model>] [--preview] [--no-preview]
+USAGE: yap listen [--locale <locale>] [--censor] [--txt] [--srt] [--vtt] [--json] [--max-length <max-length>] [--word-timestamps] [--fast] [--no-fast] [--vocabulary <vocabulary>] [--engine <engine>] [--whisper-model <whisper-model>] [--whisper-repo <whisper-repo>] [--vad <vad>] [--preview] [--no-preview]
 
 OPTIONS:
   -l, --locale <locale>   (default: current)
@@ -106,8 +106,16 @@ OPTIONS:
                           WhisperKit model variant used with --engine whisper.
                           Downloaded on first use. (default:
                           openai_whisper-large-v3-v20240930)
-  --preview/--no-preview  With --engine whisper, stream Apple's word-by-word
-                          results while Whisper finishes each sentence.
+        Shortcuts: kotoba-whisper-v2.2.
+  --whisper-repo <whisper-repo>
+                          Hugging Face repository to download --whisper-model
+                          from. (default: argmaxinc/whisperkit-coreml, or the
+                          shortcut's repository)
+  --vad <vad>             With --engine whisper, how to detect speech and pauses:
+                          silero (neural voice detection) or energy (loudness).
+                          (values: silero, energy; default: silero)
+  --preview/--no-preview  With --engine whisper, also run Apple's engine to stream
+                          words live and to fill in lines Whisper loses.
                           (default: --preview)
   -h, --help              Show help information.
 ```
@@ -118,18 +126,19 @@ OPTIONS:
 
 In the default text output, captions appear while someone is still speaking. The in-progress text is shown dimmed and redrawn in place as the transcription improves, and it's replaced by normal text once it's final. When the output is piped or redirected, only final lines are written.
 
-With `--engine whisper`, the dimmed text comes from Apple's engine, so words appear as soon as they're heard. When the speaker pauses, Whisper's corrected sentence replaces them, usually about 1.5–2 s after the speaker stops. If Whisper's output for a stretch of audio is missing most of what Apple heard (for example because Whisper looped or recited the vocabulary and was filtered out), Apple's text is kept as the final line, so nothing is lost. Use `--no-preview` to show only Whisper's output; its in-progress text then updates about once a second.
+With `--engine whisper`, the dimmed text comes from Apple's engine, so words appear as soon as they're heard. When the speaker pauses, Whisper's corrected sentence replaces them, usually about 1.5–2 s after the speaker stops. If Whisper's output for a stretch of audio is missing most of what Apple heard (for example because Whisper looped or recited the vocabulary and was filtered out), Apple's text is kept as the final line, so nothing is lost. This fallback also applies to SRT, VTT and JSON output and to piped text, where Apple's engine runs without showing anything live. Use `--no-preview` to use Whisper alone; on a terminal its in-progress text then updates about once a second.
 
 #### Engines
 
 | | `--engine apple` (default) | `--engine whisper` |
 |---|---|---|
-| Model | Apple Speech framework, built into macOS | OpenAI Whisper large-v3-turbo via [WhisperKit](https://github.com/argmaxinc/WhisperKit) |
+| Model | Apple Speech framework, built into macOS | OpenAI Whisper large-v3-turbo via [WhisperKit](https://github.com/argmaxinc/WhisperKit) (WhisperKit calls it `openai_whisper-large-v3-v20240930`; its `_turbo` variants are a different, Argmax-specific optimization) |
 | Setup | Language assets download automatically | ~1.6 GB model download on first run, plus Apple's language assets for the preview |
 | Captions | Word by word, very responsive | Apple's words as you listen, replaced by Whisper's sentence at each pause |
 | Accuracy | Good | Better, especially for names and non-English speech |
 | `--vocabulary` | Accepted, but has little visible effect | Steers spelling of the listed terms |
 | `--fast`, `--censor`, `--word-timestamps` | Supported | Ignored |
+| `--max-length` | Splits timed output into sentences | Splits timed output into even pieces at word boundaries |
 
 #### Setting up Whisper
 
@@ -140,7 +149,7 @@ yap listen --engine whisper -l ja-JP
 ```
 
 - **Download:** about 1.6 GB, stored in `~/Library/Application Support/yap/whisper`. Later runs work offline.
-- **First load:** after the download, yap prints "Loading Whisper model…". The first load can take a minute or two while macOS optimizes the model for your chip. It's faster after that, but macOS may redo this after a system update.
+- **First load:** after the download, yap prints "Loading Whisper model…". The first load can take a minute or two while macOS optimizes the model for your chip. It's faster after that, but macOS may redo this after a system update. Audio is captured from the start, so speech during the download and load isn't lost: it's transcribed once the model is ready.
 - **Hardware:** an Apple Silicon Mac. The default model uses about 2–3 GB of memory. On a Mac with 8 GB of memory, use the smaller model:
 
   ```bash
@@ -148,9 +157,10 @@ yap listen --engine whisper -l ja-JP
   ```
 
   Other models are listed at [argmaxinc/whisperkit-coreml](https://huggingface.co/argmaxinc/whisperkit-coreml).
+- **Other models:** `--whisper-model kotoba-whisper-v2.2` uses [kotoba-whisper](https://huggingface.co/kotoba-tech/kotoba-whisper-v2.2), a version of Whisper retrained on Japanese TV speech, via a [community Core ML conversion](https://huggingface.co/yslinear/kotoba-whisper-v2.2-coreml) (about 1.5 GB). It writes little punctuation and doesn't follow `--vocabulary` as well. Any other WhisperKit model can be loaded with `--whisper-repo <huggingface repo> --whisper-model <folder name>`.
 - **Removing it:** delete `~/Library/Application Support/yap/whisper`.
 
-Set `-l` to the language being spoken; Whisper uses its language code (`ja-JP` → Japanese). With the Whisper engine, a line becomes final after about 0.5 s of quiet. Scenes with continuous background music have fewer quiet gaps, so lines there may take longer to become final.
+Set `-l` to the language being spoken; Whisper uses its language code (`ja-JP` → Japanese). With the Whisper engine, a line becomes final after a pause of about 0.4 s. Speech and pauses are detected with [Silero VAD](https://github.com/snakers4/silero-vad), a small neural network that tells voices apart from music, noise and silence, so pauses are found under background music too and Whisper isn't run on sounds that aren't speech. Its model (under 1 MB) is downloaded on first use to `~/Library/Application Support/yap/vad`. With `--vad energy`, or if the model can't be downloaded, pauses are detected by loudness compared with the background level of the last 20 seconds instead. Speech that runs on without any pause is split at its least speech-like moment after 10 seconds.
 
 #### Vocabulary files
 
@@ -259,6 +269,20 @@ yap dictate
 
 # Dictate and save to a file
 yap dictate > notes.txt
+```
+
+### Development
+
+Run the tests with:
+
+```bash
+swift test
+```
+
+With only the Command Line Tools installed (no Xcode), SwiftPM doesn't find the Swift Testing macros, so point it at them:
+
+```bash
+swift test -Xswiftc -plugin-path -Xswiftc /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing
 ```
 
 ### MCP Server

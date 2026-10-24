@@ -51,12 +51,23 @@ struct Listen: AsyncParsableCommand {
     ) var engine: ListenEngine = .apple
 
     @Option(
-        help: "WhisperKit model variant used with --engine whisper. Downloaded on first use."
+        help: ArgumentHelp(
+            "WhisperKit model variant used with --engine whisper. Downloaded on first use.",
+            discussion: "Shortcuts: \(WhisperModelStore.shortcuts.keys.sorted().joined(separator: ", "))."
+        )
     ) var whisperModel: String = "openai_whisper-large-v3-v20240930"
+
+    @Option(
+        help: "Hugging Face repository to download --whisper-model from. (default: argmaxinc/whisperkit-coreml, or the shortcut's repository)"
+    ) var whisperRepo: String?
+
+    @Option(
+        help: "With --engine whisper, how to detect speech and pauses: silero (neural voice detection) or energy (loudness)."
+    ) var vad: VoiceActivityDetector = .silero
 
     @Flag(
         inversion: .prefixedNo,
-        help: "With --engine whisper, stream Apple's word-by-word results while Whisper finishes each sentence."
+        help: "With --engine whisper, also run Apple's engine to stream words live and to fill in lines Whisper loses."
     ) var preview: Bool = true
 
     @MainActor mutating func run() async throws {
@@ -339,20 +350,21 @@ struct LiveLine {
 }
 
 /// Number of terminal rows `text` occupies once wrapped, counting East Asian wide characters as two columns.
-private func terminalRows(for text: String) -> Int {
+func terminalRows(for text: String) -> Int {
     var size = winsize()
     let columns = ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col > 0 ? Int(size.ws_col) : 80
     let width = text.unicodeScalars.reduce(0) { $0 + displayWidth(of: $1) }
     return max(1, (width + columns - 1) / columns)
 }
 
-private func displayWidth(of scalar: Unicode.Scalar) -> Int {
+func displayWidth(of scalar: Unicode.Scalar) -> Int {
     let v = scalar.value
-    if scalar.properties.generalCategory == .nonspacingMark || (0x200B...0x200F).contains(v) { return 0 }
+    if scalar.properties.generalCategory == .nonspacingMark || (0x200B...0x200F).contains(v)
+        || (0xFE00...0xFE0F).contains(v) { return 0 }
     switch v {
     case 0x1100...0x115F, 0x2E80...0x303E, 0x3041...0x33FF, 0x3400...0x4DBF, 0x4E00...0x9FFF,
          0xA000...0xA4CF, 0xAC00...0xD7A3, 0xF900...0xFAFF, 0xFE30...0xFE4F, 0xFF00...0xFF60,
-         0xFFE0...0xFFE6, 0x1F300...0x1F64F, 0x1F900...0x1F9FF, 0x20000...0x3FFFD:
+         0xFFE0...0xFFE6, 0x1F000...0x1FAFF, 0x20000...0x3FFFD:
         return 2
     default:
         return 1

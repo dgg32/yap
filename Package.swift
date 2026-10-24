@@ -23,6 +23,10 @@ let package = Package(
                 .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "WhisperKit", package: "WhisperKit"),
             ]
-        )
+        ),
+        .testTarget(
+            name: "yapTests",
+            dependencies: ["yap"]
+        ),
     ]
 )

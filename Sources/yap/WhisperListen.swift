@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import CoreMedia
+import NaturalLanguage
 @preconcurrency import Noora
 import Speech
 @preconcurrency import WhisperKit
@@ -9,12 +10,82 @@ import Speech
 extension Listen {
     /// Live system-audio transcription with WhisperKit.
     ///
-    /// Audio is accumulated into a pending utterance and re-transcribed continuously.
-    /// Segments become final once speech pauses, Whisper starts a new segment, or the
-    /// utterance grows too long; everything after the last final segment is shown as tentative text.
+    /// Audio is collected into a pending utterance, which Whisper transcribes once speech pauses (or,
+    /// without a pause, once it grows long). Apple's transcriber runs alongside: on a terminal it shows
+    /// words as they're heard, and in every output format it supplies the text for lines Whisper loses.
+    /// Without Apple's transcriber, live text output falls back to re-transcribing the pending audio
+    /// to show Whisper's own tentative text.
     @MainActor func runWhisper(vocabulary: [String]) async throws {
-        nonisolated(unsafe) let whisper = try await WhisperModelStore.load(variant: whisperModel)
+        guard let targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: Double(WhisperKit.sampleRate),
+            channels: 1,
+            interleaved: false
+        ) else {
+            throw ListenError.noCompatibleAudioFormat
+        }
+        let sampleRate = Double(WhisperKit.sampleRate)
+        let format = outputFormat
+        let live = format == .txt && isatty(STDOUT_FILENO) != 0
 
+        // Start capturing first, so speech during the (possibly long) model load is buffered, not lost
+        let audio = PendingAudio()
+        let previewInput = PreviewInput()
+        let streamDelegate = AudioStreamDelegate(targetFormat: targetFormat) { buffer in
+            audio.append(buffer)
+            previewInput.feed(buffer)
+        }
+        let stream = try await makeSystemAudioStream(format: targetFormat, delegate: streamDelegate)
+        do {
+            try await stream.startCapture()
+        } catch {
+            throw ListenError.screenRecordingPermissionDenied
+        }
+        streamDelegate.startSilencePadding()
+
+        nonisolated(unsafe) let streamToStop = stream
+        onInterrupt {
+            try? await streamToStop.stopCapture()
+            audio.finish()
+        }
+
+        let output = CaptionOutput(format: format, live: live, maxLength: maxLength)
+
+        // Apple's transcriber is small and quick to start, so it comes before the Whisper model
+        var preview: ApplePreview?
+        if self.preview {
+            do {
+                let started = try await ApplePreview.start(
+                    locale: locale,
+                    vocabulary: vocabulary,
+                    sourceFormat: targetFormat
+                ) {
+                    Task { @MainActor in output.render() }
+                }
+                // Catch it up on the audio captured so far, then feed it live, keeping both timelines aligned
+                streamDelegate.queue.sync {
+                    previewInput.attach(started, replaying: audio.snapshot().samples, format: targetFormat)
+                }
+                preview = started
+            } catch {
+                FileHandle.standardError.write(Data("Apple transcriber unavailable (\(error.localizedDescription)); using Whisper output only.\n".utf8))
+            }
+        }
+        output.preview = preview
+
+        let activity: SpeechActivity
+        if vad == .silero {
+            do {
+                activity = try await SileroModelStore.load()
+            } catch {
+                FileHandle.standardError.write(Data("Silero voice detection unavailable (\(error.localizedDescription)); using loudness instead.\n".utf8))
+                activity = EnergyActivity()
+            }
+        } else {
+            activity = EnergyActivity()
+        }
+
+        nonisolated(unsafe) let whisper = try await WhisperModelStore.load(model: whisperModel, repo: whisperRepo)
         var options = DecodingOptions(
             task: .transcribe,
             language: locale.language.languageCode?.identifier,
@@ -35,56 +106,9 @@ extension Listen {
             )
         }
 
-        guard let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: Double(WhisperKit.sampleRate),
-            channels: 1,
-            interleaved: false
-        ) else {
-            throw ListenError.noCompatibleAudioFormat
-        }
-
-        let format = outputFormat
-        let captions = Captions()
-
-        // Apple's transcriber streams words immediately; Whisper replaces them with the final sentence
-        var preview: ApplePreview?
-        if self.preview, format == .txt, isatty(STDOUT_FILENO) != 0 {
-            do {
-                preview = try await ApplePreview.start(locale: locale, sourceFormat: targetFormat) {
-                    Task { @MainActor in captions.render() }
-                }
-            } catch {
-                FileHandle.standardError.write(Data("Live preview unavailable (\(error.localizedDescription)); showing Whisper output only.\n".utf8))
-            }
-        }
-        captions.preview = preview
-
-        let audio = PendingAudio()
-        let streamDelegate = AudioStreamDelegate(targetFormat: targetFormat) { [preview] buffer in
-            audio.append(buffer)
-            preview?.feed(buffer)
-        }
-        let stream = try await makeSystemAudioStream(format: targetFormat, delegate: streamDelegate)
-        do {
-            try await stream.startCapture()
-        } catch {
-            throw ListenError.screenRecordingPermissionDenied
-        }
-        streamDelegate.startSilencePadding()
-
-        nonisolated(unsafe) let streamToStop = stream
-        onInterrupt {
-            try? await streamToStop.stopCapture()
-            audio.finish()
-        }
-
         if let header = format.header(locale: locale) {
             print(header)
         }
-        var segmentIndex = 0
-        let sampleRate = Double(WhisperKit.sampleRate)
-        var lastDecodedEnd = 0
 
         func transcribe(_ samples: [Float]) async throws -> [TranscriptionSegment] {
             let results = try await whisper.transcribe(audioArray: samples, decodeOptions: options)
@@ -106,27 +130,23 @@ extension Listen {
             guard !text.isEmpty, !WhisperFilter.isUnreliable(segment, vocabulary: vocabulary),
                   !recentFinals.contains(where: { WhisperFilter.isNearDuplicate(text, $0) }) else { return }
             recentFinals = Array((recentFinals + [text]).suffix(3))
-            if format == .txt {
-                captions.addFinal(text)
-                return
-            }
-            let start = Double(offset) / sampleRate + Double(segment.start)
-            let end = Double(offset) / sampleRate + Double(segment.end)
-            let timeRange = CMTimeRange(
-                start: CMTime(seconds: start, preferredTimescale: 1000),
-                end: CMTime(seconds: end, preferredTimescale: 1000)
-            )
-            if segmentIndex > 0, let sep = format.segmentSeparator {
-                print(sep, terminator: "")
-            }
-            segmentIndex += 1
-            print(format.formatSegment(index: segmentIndex, timeRange: timeRange, text: text), terminator: "")
-            fflush(stdout)
+            let base = Double(offset) / sampleRate
+            output.add(text, start: base + Double(segment.start), end: base + Double(segment.end))
         }
+
+        // Transcribe each utterance once, unless Whisper's own tentative text is the only live feedback
+        let oncePerUtterance = preview != nil || !live
+        var analyzedUpTo = 0
+        var lastDecodedEnd = 0
+        let padding = Int(sampleRate * 0.2)
 
         while true {
             let (samples, offset, finished) = audio.snapshot()
             let end = offset + samples.count
+            if end > analyzedUpTo {
+                activity.add(samples[max(0, analyzedUpTo - offset)...])
+                analyzedUpTo = end
+            }
 
             // Wait for some new audio between decodes
             if !finished, end - lastDecodedEnd < Int(sampleRate * 0.3) {
@@ -135,14 +155,13 @@ extension Listen {
             }
             lastDecodedEnd = end
 
-            guard let speechStart = AudioLevel.firstSpeech(in: samples) else {
+            guard let speechStart = activity.firstSpeech(in: offset..<end).map({ $0 - offset }) else {
                 // Nothing worth transcribing; keep a short tail in case speech is starting
                 audio.drop(upTo: end - Int(sampleRate * 0.3))
-                captions.commit(upTo: Double(end) / sampleRate - 0.3)
+                output.commit(upTo: Double(end) / sampleRate - 0.3)
                 if finished { break }
                 continue
             }
-            let padding = Int(sampleRate * 0.2)
             if speechStart > padding {
                 // Trim leading silence so timestamps and decoding start near the speech
                 audio.drop(upTo: offset + speechStart - padding)
@@ -151,33 +170,32 @@ extension Listen {
             }
 
             // A pause ends the utterance before it, even if it fell between two decodes
-            if let pause = AudioLevel.firstPause(in: samples, minimumLength: Int(sampleRate * 0.5)) {
+            if let pause = activity.firstPause(in: offset..<end, minimumLength: Int(sampleRate * 0.4))
+                .map({ ($0.lowerBound - offset)..<($0.upperBound - offset) }) {
                 let utterance = Array(samples[..<min(samples.count, pause.lowerBound + padding)])
                 for segment in try await transcribe(utterance) {
                     emitFinal(segment, offset: offset)
                 }
                 audio.drop(upTo: offset + pause.upperBound - padding)
-                captions.commit(upTo: Double(offset + pause.upperBound - padding) / sampleRate)
+                output.commit(upTo: Double(offset + pause.upperBound - padding) / sampleRate)
                 lastDecodedEnd = 0
                 continue
             }
 
             let duration = Double(samples.count) / sampleRate
-            if preview != nil, !finished {
-                // With the live preview showing words, Whisper only runs on complete utterances, which keeps it
-                // free for the next pause and never transcribes the same audio twice. Without a pause
-                // (e.g. over background music), split long speech at its quietest moment.
+            if oncePerUtterance, !finished {
+                // Without a pause (e.g. over loud music), split long speech at its quietest moment,
+                // well inside Whisper's 30 s window
                 lastDecodedEnd = end - Int(sampleRate * 0.2)
                 guard duration >= 10 else { continue }
-                let split = AudioLevel.quietestPoint(
-                    in: samples,
-                    within: Int(sampleRate * 4)..<(samples.count - Int(sampleRate * 1))
-                )
+                let split = activity.quietestPoint(
+                    in: (offset + Int(sampleRate * 4))..<min(end - Int(sampleRate * 1), offset + Int(sampleRate * 25))
+                ) - offset
                 for segment in try await transcribe(Array(samples[..<split])) {
                     emitFinal(segment, offset: offset)
                 }
                 audio.drop(upTo: offset + split)
-                captions.commit(upTo: Double(offset + split) / sampleRate)
+                output.commit(upTo: Double(offset + split) / sampleRate)
                 lastDecodedEnd = 0
                 continue
             }
@@ -194,18 +212,18 @@ extension Listen {
 
             if settled {
                 audio.drop(upTo: end)
-                captions.whisperTentative = ""
-                captions.commit(upTo: Double(end) / sampleRate)
+                output.whisperTentative = ""
+                output.commit(upTo: Double(end) / sampleRate)
             } else {
-                captions.whisperTentative = segments.dropFirst(finalCount)
+                output.whisperTentative = segments.dropFirst(finalCount)
                     .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
                     .joined()
                 if finalCount > 0 {
                     let committedEnd = min(offset + Int(Double(segments[finalCount - 1].end) * sampleRate), end)
                     audio.drop(upTo: committedEnd)
-                    captions.commit(upTo: Double(committedEnd) / sampleRate)
+                    output.commit(upTo: Double(committedEnd) / sampleRate)
                 } else {
-                    captions.render()
+                    output.render()
                 }
             }
 
@@ -213,8 +231,66 @@ extension Listen {
         }
 
         preview?.stop()
+        output.finish()
+    }
+}
+
+// MARK: - CaptionOutput
+
+/// Output for the Whisper engine. Final lines come from Whisper, or from Apple's transcriber when
+/// Whisper lost most of a stretch of audio. On a terminal, the words after the last final line are
+/// shown as dimmed tentative text (from Apple's transcriber when available, else from Whisper).
+@MainActor
+final class CaptionOutput {
+    var preview: ApplePreview?
+    var whisperTentative = ""
+
+    private let format: OutputFormat
+    private let live: Bool
+    private let maxLength: Int
+    private var line = LiveLine()
+    private var segmentIndex = 0
+    /// Audio before this time (in seconds) already has final text.
+    private var committedTime = 0.0
+    /// Whisper's final lines for the audio since the last commit.
+    private var pending: [(text: String, start: Double, end: Double)] = []
+
+    init(format: OutputFormat, live: Bool, maxLength: Int) {
+        self.format = format
+        self.live = live
+        self.maxLength = maxLength
+    }
+
+    func add(_ text: String, start: Double, end: Double) {
+        pending.append((text, start, end))
+    }
+
+    /// Marks audio up to `time` as final and writes its lines, hiding the preview words they replaced.
+    /// If Whisper dropped most of what Apple's transcriber heard (e.g. it hallucinated and was filtered),
+    /// Apple's text is written instead.
+    func commit(upTo time: Double) {
+        let end = max(committedTime, time)
+        var lines = pending
+        if let fallback = preview?.settle(pending.map(\.text).joined(), from: committedTime, to: end) {
+            lines = [(fallback, committedTime, end)]
+        }
+        for (text, start, end) in lines {
+            write(text, start: start, end: end)
+        }
+        pending = []
+        committedTime = end
+        render()
+    }
+
+    func render() {
+        guard live else { return }
+        let text = preview?.text(after: committedTime) ?? whisperTentative
+        if text.isEmpty { line.clear() } else { line.show(text, isFinal: false) }
+    }
+
+    func finish() {
         if format == .txt {
-            captions.clear()
+            line.clear()
             print()
         } else {
             if segmentIndex > 0 { print() }
@@ -223,59 +299,122 @@ extension Listen {
             }
         }
     }
+
+    private func write(_ text: String, start: Double, end: Double) {
+        if format == .txt {
+            line.show(text, isFinal: true)
+            return
+        }
+        for cue in splitCaption(text, start: start, end: end, maxLength: maxLength) {
+            let timeRange = CMTimeRange(
+                start: CMTime(seconds: cue.start, preferredTimescale: 1000),
+                end: CMTime(seconds: cue.end, preferredTimescale: 1000)
+            )
+            if segmentIndex > 0, let sep = format.segmentSeparator {
+                print(sep, terminator: "")
+            }
+            segmentIndex += 1
+            print(format.formatSegment(index: segmentIndex, timeRange: timeRange, text: cue.text), terminator: "")
+        }
+        fflush(stdout)
+    }
 }
 
-// MARK: - Captions
+/// Splits a caption longer than `maxLength` characters into evenly sized pieces at word boundaries
+/// (which `NLTokenizer` finds for Japanese too), and divides its time range in proportion to each
+/// piece's length. Boundaries after punctuation are preferred, then Japanese boundaries between a
+/// particle and the next content word (kana followed by kanji or katakana), as in subtitles.
+func splitCaption(
+    _ text: String,
+    start: Double,
+    end: Double,
+    maxLength: Int
+) -> [(text: String, start: Double, end: Double)] {
+    guard maxLength > 0, text.count > maxLength else { return [(text, start, end)] }
 
-/// Text output for the Whisper engine: final sentences from Whisper, with the words after them
-/// shown as dimmed tentative text (from the Apple preview when available, else from Whisper).
-@MainActor
-final class Captions {
-    var preview: ApplePreview?
-    var whisperTentative = ""
-    /// Audio before this time (in seconds) already has final text.
-    private var committedTime = 0.0
-    private var line = LiveLine()
-
-    /// Whisper's final lines for the audio since the last commit.
-    private var pendingFinals: [String] = []
-
-    func addFinal(_ text: String) {
-        pendingFinals.append(text)
+    // Possible cut points, as character offsets: after each word and any punctuation or spaces following it
+    let tokenizer = NLTokenizer(unit: .word)
+    tokenizer.string = text
+    func isHiragana(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy { (0x3041...0x309F).contains($0.value) }
     }
-
-    /// Marks audio up to `time` as final and prints its text, hiding the preview words it replaced.
-    /// If Whisper dropped most of what the preview heard (e.g. it hallucinated and was filtered),
-    /// the preview's text is kept as the final line instead.
-    func commit(upTo time: Double) {
-        let end = max(committedTime, time)
-        let whisperText = pendingFinals.joined()
-        if let fallback = preview?.settle(whisperText, from: committedTime, to: end) {
-            line.show(fallback, isFinal: true)
-        } else {
-            for text in pendingFinals {
-                line.show(text, isFinal: true)
-            }
+    func isContentStart(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy { (0x4E00...0x9FFF).contains($0.value) || (0x30A0...0x30FF).contains($0.value) }
+    }
+    var cuts: [(offset: Int, bonus: Int)] = []
+    tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+        var index = range.upperBound
+        var afterPunctuation = false
+        while index < text.endIndex, text[index].isPunctuation || text[index].isWhitespace {
+            afterPunctuation = afterPunctuation || text[index].isPunctuation
+            index = text.index(after: index)
         }
-        pendingFinals = []
-        committedTime = end
-        render()
+        guard index < text.endIndex, index > text.startIndex else { return true }
+        let betweenWords = isHiragana(text[text.index(before: index)]) && isContentStart(text[index])
+        cuts.append((text.distance(from: text.startIndex, to: index), afterPunctuation ? 4 : betweenWords ? 2 : 0))
+        return true
     }
 
-    func render() {
-        let text = preview?.text(after: committedTime) ?? whisperTentative
-        if text.isEmpty { line.clear() } else { line.show(text, isFinal: false) }
+    // Cut nearest each evenly spaced target; a boundary after punctuation wins within a few characters
+    let pieceCount = (text.count + maxLength - 1) / maxLength
+    var offsets: [Int] = [0]
+    for piece in 1..<pieceCount {
+        let target = text.count * piece / pieceCount
+        let best = cuts
+            .filter { $0.offset > offsets.last! }
+            .min { cost($0, target) < cost($1, target) }
+        if let best { offsets.append(best.offset) }
+    }
+    offsets.append(text.count)
+
+    let characters = Array(text)
+    return zip(offsets, offsets.dropFirst()).compactMap { from, to in
+        let piece = String(characters[from..<to]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !piece.isEmpty else { return nil }
+        return (
+            piece,
+            start + (end - start) * Double(from) / Double(text.count),
+            start + (end - start) * Double(to) / Double(text.count)
+        )
     }
 
-    func clear() {
-        line.clear()
+    func cost(_ cut: (offset: Int, bonus: Int), _ target: Int) -> Int {
+        abs(cut.offset - target) - cut.bonus
+    }
+}
+
+// MARK: - PreviewInput
+
+/// Forwards captured audio to Apple's transcriber once it has started. Used on the audio queue.
+final class PreviewInput: @unchecked Sendable {
+    private var preview: ApplePreview?
+
+    func feed(_ buffer: AVAudioPCMBuffer) {
+        preview?.feed(buffer)
+    }
+
+    /// Feeds `samples` (everything captured so far) to `preview`, then forwards live audio to it.
+    func attach(_ preview: ApplePreview, replaying samples: [Float], format: AVAudioFormat) {
+        let chunk = 1600
+        for start in stride(from: 0, to: samples.count, by: chunk) {
+            let count = min(chunk, samples.count - start)
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)),
+                  let channel = buffer.floatChannelData?[0] else { continue }
+            buffer.frameLength = AVAudioFrameCount(count)
+            samples.withUnsafeBufferPointer { source in
+                channel.update(from: source.baseAddress! + start, count: count)
+            }
+            preview.feed(buffer)
+        }
+        self.preview = preview
     }
 }
 
 // MARK: - ApplePreview
 
-/// Runs Apple's SpeechTranscriber on the same audio to show words as soon as they're heard.
-/// Both transcribers receive identical buffers from the start, so their timelines line up.
+/// Runs Apple's SpeechTranscriber on the same audio, to show words as soon as they're heard and to
+/// supply text for lines Whisper loses. Both transcribers receive identical audio from the start of
+/// capture, so their timelines line up.
 final class ApplePreview: @unchecked Sendable {
     private let lock = NSLock()
     private var finals: [AttributedString] = []
@@ -303,6 +442,7 @@ final class ApplePreview: @unchecked Sendable {
 
     static func start(
         locale: Locale,
+        vocabulary: [String],
         sourceFormat: AVAudioFormat,
         onChange: @escaping @Sendable () -> Void
     ) async throws -> ApplePreview {
@@ -321,6 +461,11 @@ final class ApplePreview: @unchecked Sendable {
             throw ListenError.noCompatibleAudioFormat
         }
         let analyzer = SpeechAnalyzer(modules: modules)
+        if !vocabulary.isEmpty {
+            let context = AnalysisContext()
+            context.contextualStrings[.general] = vocabulary
+            try await analyzer.setContext(context)
+        }
         try await analyzer.prepareToAnalyze(in: format)
         let (inputSequence, input) = AsyncStream.makeStream(of: AnalyzerInput.self)
         try await analyzer.start(inputSequence: inputSequence)
@@ -422,8 +567,11 @@ final class ApplePreview: @unchecked Sendable {
             }
             let previewText = finalsText + String(characters[volatileConsumed..<estimatedCut])
 
+            // Even two characters (はい, そう) are a complete reply, but filler alone (ん, っ) is not
             let previewLetters = letters(previewText)
-            if previewLetters >= 4, letters(whisperText) * 2 < previewLetters {
+            let previewContent = previewText.filter { !Self.isPunctuation($0) }
+            if previewLetters >= 2, !previewContent.allSatisfy(WhisperFilter.fillerCharacters.contains),
+               letters(whisperText) * 2 < previewLetters {
                 volatileConsumed = estimatedCut
                 return previewText.trimmingCharacters(in: .whitespacesAndNewlines)
             }
@@ -431,12 +579,20 @@ final class ApplePreview: @unchecked Sendable {
             if estimatedCut == characters.count || estimatedCut == volatileConsumed {
                 volatileConsumed = estimatedCut
             } else {
-                // Count Whisper's characters into the volatile text, past what Apple's finals covered
+                // Count Whisper's characters into the volatile text, past what Apple's finals covered.
+                // Kanji and kana spellings of the same words differ in length, so move the cut to
+                // punctuation close by, where Apple marks the pause that ended Whisper's sentence.
                 var remaining = letters(whisperText) - letters(finalsText)
                 var index = volatileConsumed
                 while index < characters.count, remaining > 0 {
                     if !Self.isPunctuation(characters[index]) { remaining -= 1 }
                     index += 1
+                }
+                let nearby = max(volatileConsumed, index - 3)..<min(characters.count, index + 3)
+                if let punctuation = nearby
+                    .filter({ Self.isPunctuation(characters[$0]) && !characters[$0].isWhitespace })
+                    .min(by: { abs($0 + 1 - index) < abs($1 + 1 - index) }) {
+                    index = punctuation + 1
                 }
                 while index < characters.count, Self.isPunctuation(characters[index]) {
                     index += 1
@@ -515,56 +671,11 @@ final class PendingAudio: @unchecked Sendable {
 // MARK: - AudioLevel
 
 enum AudioLevel {
-    /// RMS level below which a 30 ms frame counts as silence.
+    /// RMS level below which a 30 ms frame counts as silence, until a noise floor has been measured.
     static let silenceThreshold: Float = 0.01
-    static let frameLength = 480
 
-    /// Index of the first frame containing speech, or nil if `samples` is silent.
-    static func firstSpeech(in samples: [Float]) -> Int? {
-        stride(from: 0, to: samples.count, by: frameLength).first { rms(samples, from: $0) >= silenceThreshold }
-    }
-
-    /// Start of the quietest 300 ms window within `range`, the best place to split speech without a pause.
-    static func quietestPoint(in samples: [Float], within range: Range<Int>) -> Int {
-        let window = 10
-        let frames = stride(from: range.lowerBound, to: range.upperBound, by: frameLength).map { rms(samples, from: $0) }
-        guard frames.count > window else { return range.upperBound }
-        var best = 0
-        var bestLevel = Float.infinity
-        for index in 0...(frames.count - window) {
-            let level = frames[index..<(index + window)].reduce(0, +)
-            if level < bestLevel {
-                bestLevel = level
-                best = index
-            }
-        }
-        // Split in the middle of the quiet window
-        return min(range.lowerBound + (best + window / 2) * frameLength, range.upperBound)
-    }
-
-    /// The first run of silence at least `minimumLength` samples long that follows speech.
-    static func firstPause(in samples: [Float], minimumLength: Int) -> Range<Int>? {
-        var heardSpeech = false
-        var silenceStart: Int?
-        for start in stride(from: 0, to: samples.count, by: frameLength) {
-            if rms(samples, from: start) >= silenceThreshold {
-                if heardSpeech, let silenceStart, start - silenceStart >= minimumLength {
-                    return silenceStart..<start
-                }
-                heardSpeech = true
-                silenceStart = nil
-            } else if heardSpeech, silenceStart == nil {
-                silenceStart = start
-            }
-        }
-        if let silenceStart, samples.count - silenceStart >= minimumLength {
-            return silenceStart..<samples.count
-        }
-        return nil
-    }
-
-    private static func rms(_ samples: [Float], from start: Int) -> Float {
-        let end = min(start + frameLength, samples.count)
+    static func rms(_ samples: [Float], from start: Int, length: Int = 480) -> Float {
+        let end = min(start + length, samples.count)
         guard end > start else { return 0 }
         var sum: Float = 0
         for i in start..<end {
@@ -577,27 +688,39 @@ enum AudioLevel {
 // MARK: - WhisperFilter
 
 enum WhisperFilter {
-    /// Phrases Whisper tends to invent on music or silence (learned from video subtitles).
-    /// Matched as regular expressions to also catch misspellings like ご視力ありがとうございました.
+    /// Phrases Whisper tends to invent on music or silence (learned from video subtitles). Matched as
+    /// regular expressions to also catch misspellings like ご視力ありがとうございました, and only when
+    /// the phrase is essentially the whole line, so real speech that contains these words is kept.
     static let knownHallucinations = [
-        "ご視.{0,2}ありがとうございま",
-        "ご清聴ありがとうございま",
-        "最後までご視",
-        "チャンネル登録",
-        "字幕",
-        "thank(s| you) for watching",
+        "ご視.{0,2}ありがとうございま(した|す)",
+        "ご清聴ありがとうございま(した|す)",
+        "最後までご視.{0,2}(いただき)?ありがとうございま(した|す)",
+        "チャンネル登録(を)?(よろしく)?お願いします",
+        "字幕.{0,12}(作成|提供|制作)",
+        "thank(s| you) (so much )?for watching",
     ]
 
     /// Fillers Whisper emits for breaths, grunts and sound effects.
     static let fillerCharacters = Set("んンーっッ〜")
 
+    static func letters(_ text: String) -> String {
+        text.filter { !$0.isPunctuation && !$0.isWhitespace && !$0.isSymbol }
+    }
+
     static func isLikelyHallucination(_ segment: TranscriptionSegment) -> Bool {
-        let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let content = text.filter { !$0.isPunctuation && !$0.isWhitespace && !$0.isSymbol }
+        isLikelyHallucination(segment.text)
+    }
+
+    static func isLikelyHallucination(_ text: String) -> Bool {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let content = letters(text)
         if content.isEmpty { return true }
         if content.allSatisfy(fillerCharacters.contains) { return true }
-        return knownHallucinations.contains {
-            text.range(of: $0, options: [.regularExpression, .caseInsensitive]) != nil
+        return knownHallucinations.contains { pattern in
+            guard let range = text.range(of: pattern, options: [.regularExpression, .caseInsensitive]) else {
+                return false
+            }
+            return letters(String(text[range])).count * 5 >= content.count * 4
         }
     }
 
@@ -605,90 +728,111 @@ enum WhisperFilter {
     /// reciting the vocabulary prompt. Only applied to final text: tentative guesses on partial speech
     /// are often low-confidence, and hiding them would delay the captions.
     static func isUnreliable(_ segment: TranscriptionSegment, vocabulary: [String] = []) -> Bool {
-        let letters = segment.text.filter { !$0.isPunctuation && !$0.isWhitespace }
-        if segment.noSpeechProb > 0.6, letters.count <= 4 || segment.avgLogprob < -1 { return true }
+        let content = letters(segment.text)
+        if segment.noSpeechProb > 0.6, content.count <= 4 || segment.avgLogprob < -1 { return true }
         if segment.avgLogprob < -1.2 || segment.compressionRatio > 2.4 { return true }
-        return hasRepeatedPhrase(String(letters)) || echoesVocabulary(String(letters), vocabulary: vocabulary)
+        return hasRepeatedPhrase(content) || recitesVocabulary(content, vocabulary: vocabulary)
     }
 
-    /// True when a phrase repeats back to back: 2–3 characters four or more times, or 4–20 characters
-    /// three or more times. Whisper loops like this on music and noise.
+    /// True when a phrase of 2–20 characters repeats back to back for at least 20 characters, making up
+    /// at least half the line. Whisper loops like this on music and noise; ordinary reduplication
+    /// (なるほどなるほどなるほど, はいはいはいはい) is much shorter.
     static func hasRepeatedPhrase(_ text: String) -> Bool {
         let characters = Array(text)
+        guard characters.count >= 20 else { return false }
         for length in 2...20 {
-            let repeats = length <= 3 ? 4 : 3
-            guard characters.count >= length * repeats else { break }
-            for start in 0...(characters.count - length * repeats) {
-                let phrase = characters[start..<(start + length)]
-                if (1..<repeats).allSatisfy({ characters[(start + $0 * length)..<(start + ($0 + 1) * length)] == phrase }) {
+            var start = 0
+            while start + length * 2 <= characters.count {
+                var repeats = 1
+                while start + (repeats + 1) * length <= characters.count,
+                      characters[(start + repeats * length)..<(start + (repeats + 1) * length)]
+                      == characters[start..<(start + length)] {
+                    repeats += 1
+                }
+                let span = repeats * length
+                if repeats >= 3, span >= 20, span * 2 >= characters.count {
                     return true
                 }
+                start += 1
             }
         }
         return false
     }
 
-    /// True when most of the text is vocabulary terms, which happens when Whisper repeats its prompt.
-    static func echoesVocabulary(_ text: String, vocabulary: [String]) -> Bool {
-        guard !text.isEmpty else { return false }
-        var matched = 0
-        var distinct = 0
-        for term in vocabulary where !term.isEmpty {
-            let count = text.components(separatedBy: term).count - 1
-            if count > 0 {
-                distinct += 1
-                matched += count * term.count
+    /// True when the line is the vocabulary list read back: at least four different terms, in the
+    /// order of the list, with almost nothing else. Whisper does this when it echoes its prompt;
+    /// real dialogue that mentions several terms has particles and other words between them.
+    static func recitesVocabulary(_ text: String, vocabulary: [String]) -> Bool {
+        let terms = vocabulary.enumerated()
+            .map { (index: $0.offset, term: letters($0.element)) }
+            .filter { !$0.term.isEmpty }
+            .sorted { $0.term.count > $1.term.count }
+        guard !terms.isEmpty else { return false }
+
+        // Match the longest term at each position, so 黄金聖闘士 isn't also counted as 聖闘士
+        var matches: [Int] = []
+        var unmatched = 0
+        var rest = Substring(text)
+        while !rest.isEmpty {
+            if let match = terms.first(where: { rest.hasPrefix($0.term) }) {
+                matches.append(match.index)
+                rest = rest.dropFirst(match.term.count)
+            } else {
+                unmatched += 1
+                rest = rest.dropFirst()
             }
         }
-        return distinct >= 3 && matched * 2 >= text.count
+        guard Set(matches).count >= 4, unmatched * 10 <= text.count else { return false }
+        let inOrder = zip(matches, matches.dropFirst()).filter { $0 < $1 }.count
+        return inOrder * 5 >= (matches.count - 1) * 4
     }
 
-    /// True when two lines are the same speech transcribed twice: they share most of their character
-    /// pairs, or most of the shorter line appears word for word in the longer one.
+    /// True when two lines are the same speech transcribed twice: nearly the same length and nearly
+    /// all of their character pairs in common. Lines that merely share a phrase (十二宮の聖闘士たち,
+    /// 十二宮の黄金聖闘士たち) are different lines.
     static func isNearDuplicate(_ a: String, _ b: String) -> Bool {
-        let x = Array(a.filter { !$0.isPunctuation && !$0.isWhitespace })
-        let y = Array(b.filter { !$0.isPunctuation && !$0.isWhitespace })
-        let shorter = min(x.count, y.count)
+        let x = Array(letters(a))
+        let y = Array(letters(b))
+        let (shorter, longer) = (min(x.count, y.count), max(x.count, y.count))
         guard shorter > 6 else { return x == y }
+        guard shorter * 5 >= longer * 4 else { return false }
 
         func bigrams(_ characters: [Character]) -> Set<String> {
             Set((0..<(characters.count - 1)).map { String(characters[$0...($0 + 1)]) })
         }
         let (bx, by) = (bigrams(x), bigrams(y))
-        if Double(bx.intersection(by).count) / Double(bx.union(by).count) >= 0.6 { return true }
-
-        // Longest common substring
-        var longest = 0
-        var previous = [Int](repeating: 0, count: y.count + 1)
-        for i in 1...x.count {
-            var current = [Int](repeating: 0, count: y.count + 1)
-            for j in 1...y.count where x[i - 1] == y[j - 1] {
-                current[j] = previous[j - 1] + 1
-                longest = max(longest, current[j])
-            }
-            previous = current
-        }
-        return Double(longest) >= Double(shorter) * 0.7
+        return Double(bx.intersection(by).count) / Double(bx.union(by).count) >= 0.8
     }
 }
 
 // MARK: - WhisperModelStore
 
 enum WhisperModelStore {
-    static let repo = "argmaxinc/whisperkit-coreml"
+    static let defaultRepo = "argmaxinc/whisperkit-coreml"
+
+    /// Short names for models outside the default repository, as (repository, variant).
+    static let shortcuts: [String: (repo: String, variant: String)] = [
+        // Whisper large-v3 distilled and retrained on Japanese TV speech (ReazonSpeech) by Kotoba
+        // Technologies; community Core ML conversion
+        "kotoba-whisper-v2.2": ("yslinear/kotoba-whisper-v2.2-coreml", "kotoba-tech_kotoba-whisper-v2.2"),
+    ]
 
     /// Models are kept in ~/Library/Application Support/yap/whisper.
     static var downloadBase: URL {
         URL.applicationSupportDirectory.appending(path: "yap/whisper", directoryHint: .isDirectory)
     }
 
-    static func localFolder(variant: String) -> URL {
+    static func localFolder(variant: String, repo: String) -> URL {
         downloadBase.appending(path: "models/\(repo)/\(variant)", directoryHint: .isDirectory)
     }
 
-    /// Downloads the model on first use (with a progress bar) and loads it.
-    static func load(variant: String) async throws -> WhisperKit {
-        var folder = localFolder(variant: variant)
+    /// Downloads the model on first use (with a progress bar) and loads it. `model` is a variant
+    /// name in `repo` (default: `defaultRepo`) or one of the `shortcuts`.
+    static func load(model: String, repo: String?) async throws -> WhisperKit {
+        let shortcut = shortcuts[model]
+        let variant = shortcut?.variant ?? model
+        let repo = repo ?? shortcut?.repo ?? defaultRepo
+        var folder = localFolder(variant: variant, repo: repo)
         let isDownloaded = ["AudioEncoder.mlmodelc", "TextDecoder.mlmodelc", "MelSpectrogram.mlmodelc"].allSatisfy {
             FileManager.default.fileExists(atPath: folder.appending(path: $0).path)
         }
