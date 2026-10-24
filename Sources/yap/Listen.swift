@@ -54,6 +54,11 @@ struct Listen: AsyncParsableCommand {
         help: "WhisperKit model variant used with --engine whisper. Downloaded on first use."
     ) var whisperModel: String = "openai_whisper-large-v3-v20240930"
 
+    @Flag(
+        inversion: .prefixedNo,
+        help: "With --engine whisper, stream Apple's word-by-word results while Whisper finishes each sentence."
+    ) var preview: Bool = true
+
     @MainActor mutating func run() async throws {
         var contextualStrings: [String] = []
         if let vocabulary {
@@ -74,20 +79,7 @@ struct Listen: AsyncParsableCommand {
             return
         }
 
-        guard SpeechTranscriber.isAvailable else {
-            throw Transcribe.Error.speechTranscriberNotAvailable
-        }
-
-        let supportedLocales = await SpeechTranscriber.supportedLocales
-        guard supportedLocales.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) else {
-            throw Transcribe.Error.unsupportedLocale
-        }
-
-        for locale in await AssetInventory.reservedLocales {
-            await AssetInventory.release(reservedLocale: locale)
-        }
-        try await AssetInventory.reserve(locale: locale)
-
+        try await reserveSpeechAssets(for: locale)
 
         let transcriber = SpeechTranscriber(
             locale: locale,
@@ -97,36 +89,7 @@ struct Listen: AsyncParsableCommand {
         )
         let modules: [any SpeechModule] = [transcriber]
 
-        let installedLocales = await SpeechTranscriber.installedLocales
-        if !installedLocales.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) {
-            let piped = isatty(STDOUT_FILENO) == 0
-            struct DevNull: StandardPipelining { func write(content _: String) {} }
-            let noora = if piped {
-                Noora(standardPipelines: .init(output: DevNull()))
-            } else {
-                Noora()
-            }
-            if let request = try await AssetInventory.assetInstallationRequest(supporting: modules) {
-                try await noora.progressBarStep(
-                    message: "Downloading required assets…"
-                ) { @Sendable progressCallback in
-                    struct ReportProgress: @unchecked Sendable {
-                        let callAsFunction: (Double) -> Void
-                    }
-                    let reportProgress = ReportProgress(callAsFunction: progressCallback)
-                    try await withThrowingDiscardingTaskGroup { group in
-                        group.addTask {
-                            while !Task.isCancelled, !request.progress.isFinished {
-                                reportProgress.callAsFunction(request.progress.fractionCompleted)
-                                try await Task.sleep(for: .seconds(0.1))
-                            }
-                        }
-                        try await request.downloadAndInstall()
-                        group.cancelAll()
-                    }
-                }
-            }
-        }
+        try await installSpeechAssets(for: locale, modules: modules)
 
         let analyzer = SpeechAnalyzer(modules: modules)
         if !contextualStrings.isEmpty {
@@ -225,6 +188,57 @@ enum ListenEngine: String, ExpressibleByArgument, CaseIterable {
     case whisper
 }
 
+/// Checks that the Speech framework supports `locale` and reserves its assets.
+func reserveSpeechAssets(for locale: Locale) async throws {
+    guard SpeechTranscriber.isAvailable else {
+        throw Transcribe.Error.speechTranscriberNotAvailable
+    }
+
+    let supportedLocales = await SpeechTranscriber.supportedLocales
+    guard supportedLocales.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) else {
+        throw Transcribe.Error.unsupportedLocale
+    }
+
+    for locale in await AssetInventory.reservedLocales {
+        await AssetInventory.release(reservedLocale: locale)
+    }
+    try await AssetInventory.reserve(locale: locale)
+}
+
+/// Downloads the Speech framework assets for `modules` if they aren't installed yet.
+func installSpeechAssets(for locale: Locale, modules: [any SpeechModule]) async throws {
+    let installedLocales = await SpeechTranscriber.installedLocales
+    if !installedLocales.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) {
+        let piped = isatty(STDOUT_FILENO) == 0
+        struct DevNull: StandardPipelining { func write(content _: String) {} }
+        let noora = if piped {
+            Noora(standardPipelines: .init(output: DevNull()))
+        } else {
+            Noora()
+        }
+        if let request = try await AssetInventory.assetInstallationRequest(supporting: modules) {
+            try await noora.progressBarStep(
+                message: "Downloading required assets…"
+            ) { @Sendable progressCallback in
+                struct ReportProgress: @unchecked Sendable {
+                    let callAsFunction: (Double) -> Void
+                }
+                let reportProgress = ReportProgress(callAsFunction: progressCallback)
+                try await withThrowingDiscardingTaskGroup { group in
+                    group.addTask {
+                        while !Task.isCancelled, !request.progress.isFinished {
+                            reportProgress.callAsFunction(request.progress.fractionCompleted)
+                            try await Task.sleep(for: .seconds(0.1))
+                        }
+                    }
+                    try await request.downloadAndInstall()
+                    group.cancelAll()
+                }
+            }
+        }
+    }
+}
+
 /// Creates a ScreenCaptureKit stream that delivers system audio to `delegate`.
 /// Requires Screen Recording permission for the terminal app.
 func makeSystemAudioStream(format: AVAudioFormat, delegate: AudioStreamDelegate) async throws -> SCStream {
@@ -291,7 +305,7 @@ func onInterrupt(_ shutdown: @escaping @Sendable () async -> Void) {
     }
 }
 
-/// Prints live text output: tentative text is redrawn in place, final text ends with a newline.
+/// Prints live text output: tentative text is redrawn in place (dimmed), final text ends with a newline.
 /// When stdout is not a terminal, only final text is printed.
 struct LiveLine {
     private let redraw = isatty(STDOUT_FILENO) != 0
@@ -306,7 +320,11 @@ struct LiveLine {
         // Erase the previous tentative text, which may have wrapped over several rows:
         // move up to its first row, return to column 0, and clear to the end of the screen.
         if tentativeRows > 1 { print("\u{1B}[\(tentativeRows - 1)A", terminator: "") }
-        print("\r\u{1B}[J\(text)", terminator: isFinal ? "\n" : "")
+        if isFinal {
+            print("\r\u{1B}[J\(text)")
+        } else {
+            print("\r\u{1B}[J\u{1B}[2m\(text)\u{1B}[0m", terminator: "")
+        }
         tentativeRows = isFinal ? 0 : terminalRows(for: text)
     }
 

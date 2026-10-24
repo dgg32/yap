@@ -83,7 +83,7 @@ yap video.mp4 --json --word-timestamps -o transcript.json
 `yap listen` transcribes system audio in real time — anything playing on your computer.
 
 ```
-USAGE: yap listen [--locale <locale>] [--censor] [--txt] [--srt] [--vtt] [--json] [--max-length <max-length>] [--word-timestamps] [--fast] [--no-fast] [--vocabulary <vocabulary>] [--engine <engine>] [--whisper-model <whisper-model>]
+USAGE: yap listen [--locale <locale>] [--censor] [--txt] [--srt] [--vtt] [--json] [--max-length <max-length>] [--word-timestamps] [--fast] [--no-fast] [--vocabulary <vocabulary>] [--engine <engine>] [--whisper-model <whisper-model>] [--preview] [--no-preview]
 
 OPTIONS:
   -l, --locale <locale>   (default: current)
@@ -106,6 +106,9 @@ OPTIONS:
                           WhisperKit model variant used with --engine whisper.
                           Downloaded on first use. (default:
                           openai_whisper-large-v3-v20240930)
+  --preview/--no-preview  With --engine whisper, stream Apple's word-by-word
+                          results while Whisper finishes each sentence.
+                          (default: --preview)
   -h, --help              Show help information.
 ```
 
@@ -113,15 +116,17 @@ OPTIONS:
 
 #### Live captions
 
-In the default text output, captions appear while someone is still speaking. The current line is redrawn in place as the transcription improves, and it moves to a new line once it's final. When the output is piped or redirected, only final lines are written.
+In the default text output, captions appear while someone is still speaking. The in-progress text is shown dimmed and redrawn in place as the transcription improves, and it's replaced by normal text once it's final. When the output is piped or redirected, only final lines are written.
+
+With `--engine whisper`, the dimmed text comes from Apple's engine, so words appear as soon as they're heard. When the speaker pauses, Whisper's corrected sentence replaces them, usually about 1.5–2 s after the speaker stops. If Whisper's output for a stretch of audio is missing most of what Apple heard (for example because Whisper looped or recited the vocabulary and was filtered out), Apple's text is kept as the final line, so nothing is lost. Use `--no-preview` to show only Whisper's output; its in-progress text then updates about once a second.
 
 #### Engines
 
 | | `--engine apple` (default) | `--engine whisper` |
 |---|---|---|
 | Model | Apple Speech framework, built into macOS | OpenAI Whisper large-v3-turbo via [WhisperKit](https://github.com/argmaxinc/WhisperKit) |
-| Setup | Language assets download automatically | ~1.6 GB model download on first run |
-| Captions | Word by word, very responsive | Updated about once a second, final after a short pause |
+| Setup | Language assets download automatically | ~1.6 GB model download on first run, plus Apple's language assets for the preview |
+| Captions | Word by word, very responsive | Apple's words as you listen, replaced by Whisper's sentence at each pause |
 | Accuracy | Good | Better, especially for names and non-English speech |
 | `--vocabulary` | Accepted, but has little visible effect | Steers spelling of the listed terms |
 | `--fast`, `--censor`, `--word-timestamps` | Supported | Ignored |
@@ -145,7 +150,7 @@ yap listen --engine whisper -l ja-JP
   Other models are listed at [argmaxinc/whisperkit-coreml](https://huggingface.co/argmaxinc/whisperkit-coreml).
 - **Removing it:** delete `~/Library/Application Support/yap/whisper`.
 
-Set `-l` to the language being spoken; Whisper uses its language code (`ja-JP` → Japanese). With the Whisper engine, a line becomes final after about 0.6 s of quiet. Scenes with continuous background music have fewer quiet gaps, so lines there may take longer to become final.
+Set `-l` to the language being spoken; Whisper uses its language code (`ja-JP` → Japanese). With the Whisper engine, a line becomes final after about 0.5 s of quiet. Scenes with continuous background music have fewer quiet gaps, so lines there may take longer to become final.
 
 #### Vocabulary files
 
