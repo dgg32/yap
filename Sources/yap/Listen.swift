@@ -37,7 +37,43 @@ struct Listen: AsyncParsableCommand {
         help: "Include word-level timestamps in JSON output."
     ) var wordTimestamps: Bool = false
 
+    @Flag(
+        inversion: .prefixedNo,
+        help: "Favor responsiveness over accuracy. Use --no-fast for more accurate but slower results."
+    ) var fast: Bool = true
+
+    @Option(
+        help: "Path to a text file of names and terms to expect, one per line (lines starting with # are ignored)."
+    ) var vocabulary: String?
+
+    @Option(
+        help: "Speech recognition engine: apple (on-device Speech framework) or whisper (WhisperKit, more accurate)."
+    ) var engine: ListenEngine = .apple
+
+    @Option(
+        help: "WhisperKit model variant used with --engine whisper. Downloaded on first use."
+    ) var whisperModel: String = "openai_whisper-large-v3-v20240930"
+
     @MainActor mutating func run() async throws {
+        var contextualStrings: [String] = []
+        if let vocabulary {
+            let contents: String
+            do {
+                contents = try String(contentsOfFile: vocabulary, encoding: .utf8)
+            } catch {
+                throw ListenError.unreadableVocabulary(vocabulary)
+            }
+            contextualStrings = contents
+                .split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+        }
+
+        if engine == .whisper {
+            try await runWhisper(vocabulary: contextualStrings)
+            return
+        }
+
         guard SpeechTranscriber.isAvailable else {
             throw Transcribe.Error.speechTranscriberNotAvailable
         }
@@ -52,10 +88,11 @@ struct Listen: AsyncParsableCommand {
         }
         try await AssetInventory.reserve(locale: locale)
 
+
         let transcriber = SpeechTranscriber(
             locale: locale,
             transcriptionOptions: censor ? [.etiquetteReplacements] : [],
-            reportingOptions: [],
+            reportingOptions: fast ? [.volatileResults, .fastResults] : [.volatileResults],
             attributeOptions: outputFormat.needsAudioTimeRange ? [.audioTimeRange] : []
         )
         let modules: [any SpeechModule] = [transcriber]
@@ -92,6 +129,11 @@ struct Listen: AsyncParsableCommand {
         }
 
         let analyzer = SpeechAnalyzer(modules: modules)
+        if !contextualStrings.isEmpty {
+            let context = AnalysisContext()
+            context.contextualStrings[.general] = contextualStrings
+            try await analyzer.setContext(context)
+        }
 
         // Set up streaming input
         let (inputSequence, inputContinuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
@@ -103,81 +145,27 @@ struct Listen: AsyncParsableCommand {
             throw ListenError.noCompatibleAudioFormat
         }
 
-        // Set up ScreenCaptureKit for system audio capture
-        // Requires Screen Recording permission for the terminal app
-        let content: SCShareableContent
-        do {
-            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        } catch {
-            throw ListenError.screenRecordingPermissionDenied
-        }
-        guard let display = content.displays.first else {
-            throw ListenError.screenRecordingPermissionDenied
-        }
-
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-        let streamConfig = SCStreamConfiguration()
-        streamConfig.capturesAudio = true
-        streamConfig.sampleRate = Int(targetFormat.sampleRate)
-        streamConfig.channelCount = Int(targetFormat.channelCount)
-        streamConfig.excludesCurrentProcessAudio = true
-        // Minimal video settings since we only need audio
-        streamConfig.width = 2
-        streamConfig.height = 2
-        streamConfig.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-
         let streamDelegate = AudioStreamDelegate(
             targetFormat: targetFormat,
             inputContinuation: inputContinuation
         )
+        let stream = try await makeSystemAudioStream(format: targetFormat, delegate: streamDelegate)
 
-        let stream = SCStream(filter: filter, configuration: streamConfig, delegate: nil)
-        try stream.addStreamOutput(streamDelegate, type: .audio, sampleHandlerQueue: .global())
+        // Load the model up front so the first words aren't delayed
+        try await analyzer.prepareToAnalyze(in: targetFormat)
+
         do {
             try await stream.startCapture()
         } catch {
             throw ListenError.screenRecordingPermissionDenied
         }
+        streamDelegate.startSilencePadding()
 
         // Start the analyzer with streaming input
         try await analyzer.start(inputSequence: inputSequence)
 
-        // Set up graceful shutdown
-        var signalPipe: [Int32] = [0, 0]
-        pipe(&signalPipe)
-        let signalReadFD = signalPipe[0]
-        listenSignalWriteFD = signalPipe[1]
-
-        // Suppress ^C echo
-        var originalTermios = termios()
-        let hasTerminal = isatty(STDIN_FILENO) != 0
-        if hasTerminal {
-            tcgetattr(STDIN_FILENO, &originalTermios)
-            var raw = originalTermios
-            raw.c_lflag &= ~UInt(ECHOCTL)
-            tcsetattr(STDIN_FILENO, TCSANOW, &raw)
-        }
-
-        signal(SIGINT) { _ in
-            _ = write(listenSignalWriteFD, "x", 1)
-        }
-
-        if isatty(STDERR_FILENO) != 0 {
-            FileHandle.standardError.write(Data("Listening… Press Ctrl+C to stop.\n".utf8))
-        }
-
-        // Wait for SIGINT in background, then gracefully shut down
         nonisolated(unsafe) let streamToStop = stream
-        nonisolated(unsafe) var savedTermios = originalTermios
-        let restoreTerminal = hasTerminal
-        Task.detached {
-            var buf: UInt8 = 0
-            _ = read(signalReadFD, &buf, 1)
-            close(signalReadFD)
-            close(listenSignalWriteFD)
-            if restoreTerminal {
-                tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios)
-            }
+        onInterrupt {
             try? await streamToStop.stopCapture()
             inputContinuation.finish()
             try? await analyzer.finalizeAndFinishThroughEndOfInput()
@@ -187,12 +175,12 @@ struct Listen: AsyncParsableCommand {
         let format = outputFormat
         let sentenceMaxLength = maxLength
         if format == .txt {
+            var line = LiveLine()
             for try await result in transcriber.results {
                 let text = String(result.text.characters)
-                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    print(text, terminator: "")
-                    fflush(stdout)
-                }
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { continue }
+                line.show(text, isFinal: result.isFinal)
             }
             print()
         } else {
@@ -202,6 +190,7 @@ struct Listen: AsyncParsableCommand {
             let includeWords = wordTimestamps
             var segmentIndex = 0
             for try await result in transcriber.results {
+                guard result.isFinal else { continue }
                 for chunk in result.text.splitAtTimeGaps(threshold: 1.5) {
                     let allWords = includeWords ? chunk.wordTimestamps() : nil
                     for sentence in chunk.sentences(maxLength: sentenceMaxLength) {
@@ -229,21 +218,175 @@ struct Listen: AsyncParsableCommand {
     }
 }
 
+// MARK: - Shared live capture helpers
+
+enum ListenEngine: String, ExpressibleByArgument, CaseIterable {
+    case apple
+    case whisper
+}
+
+/// Creates a ScreenCaptureKit stream that delivers system audio to `delegate`.
+/// Requires Screen Recording permission for the terminal app.
+func makeSystemAudioStream(format: AVAudioFormat, delegate: AudioStreamDelegate) async throws -> SCStream {
+    let content: SCShareableContent
+    do {
+        content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+    } catch {
+        throw ListenError.screenRecordingPermissionDenied
+    }
+    guard let display = content.displays.first else {
+        throw ListenError.screenRecordingPermissionDenied
+    }
+
+    let filter = SCContentFilter(display: display, excludingWindows: [])
+    let streamConfig = SCStreamConfiguration()
+    streamConfig.capturesAudio = true
+    streamConfig.sampleRate = Int(format.sampleRate)
+    streamConfig.channelCount = Int(format.channelCount)
+    streamConfig.excludesCurrentProcessAudio = true
+    // Minimal video settings since we only need audio
+    streamConfig.width = 2
+    streamConfig.height = 2
+    streamConfig.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+
+    let stream = SCStream(filter: filter, configuration: streamConfig, delegate: nil)
+    try stream.addStreamOutput(delegate, type: .audio, sampleHandlerQueue: delegate.queue)
+    return stream
+}
+
+/// Suppresses the ^C echo, prints the "Listening…" hint, and runs `shutdown` once on Ctrl+C.
+func onInterrupt(_ shutdown: @escaping @Sendable () async -> Void) {
+    var signalPipe: [Int32] = [0, 0]
+    pipe(&signalPipe)
+    let signalReadFD = signalPipe[0]
+    listenSignalWriteFD = signalPipe[1]
+
+    var originalTermios = termios()
+    let hasTerminal = isatty(STDIN_FILENO) != 0
+    if hasTerminal {
+        tcgetattr(STDIN_FILENO, &originalTermios)
+        var raw = originalTermios
+        raw.c_lflag &= ~UInt(ECHOCTL)
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw)
+    }
+
+    signal(SIGINT) { _ in
+        _ = write(listenSignalWriteFD, "x", 1)
+    }
+
+    if isatty(STDERR_FILENO) != 0 {
+        FileHandle.standardError.write(Data("Listening… Press Ctrl+C to stop.\n".utf8))
+    }
+
+    nonisolated(unsafe) var savedTermios = originalTermios
+    Task.detached {
+        var buf: UInt8 = 0
+        _ = read(signalReadFD, &buf, 1)
+        close(signalReadFD)
+        close(listenSignalWriteFD)
+        if hasTerminal {
+            tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios)
+        }
+        await shutdown()
+    }
+}
+
+/// Prints live text output: tentative text is redrawn in place, final text ends with a newline.
+/// When stdout is not a terminal, only final text is printed.
+struct LiveLine {
+    private let redraw = isatty(STDOUT_FILENO) != 0
+    private var tentativeRows = 0
+
+    mutating func show(_ text: String, isFinal: Bool) {
+        defer { fflush(stdout) }
+        guard redraw else {
+            if isFinal { print(text) }
+            return
+        }
+        // Erase the previous tentative text, which may have wrapped over several rows:
+        // move up to its first row, return to column 0, and clear to the end of the screen.
+        if tentativeRows > 1 { print("\u{1B}[\(tentativeRows - 1)A", terminator: "") }
+        print("\r\u{1B}[J\(text)", terminator: isFinal ? "\n" : "")
+        tentativeRows = isFinal ? 0 : terminalRows(for: text)
+    }
+
+    /// Removes any tentative text from the screen.
+    mutating func clear() {
+        guard redraw, tentativeRows > 0 else { return }
+        if tentativeRows > 1 { print("\u{1B}[\(tentativeRows - 1)A", terminator: "") }
+        print("\r\u{1B}[J", terminator: "")
+        tentativeRows = 0
+        fflush(stdout)
+    }
+}
+
+/// Number of terminal rows `text` occupies once wrapped, counting East Asian wide characters as two columns.
+private func terminalRows(for text: String) -> Int {
+    var size = winsize()
+    let columns = ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col > 0 ? Int(size.ws_col) : 80
+    let width = text.unicodeScalars.reduce(0) { $0 + displayWidth(of: $1) }
+    return max(1, (width + columns - 1) / columns)
+}
+
+private func displayWidth(of scalar: Unicode.Scalar) -> Int {
+    let v = scalar.value
+    if scalar.properties.generalCategory == .nonspacingMark || (0x200B...0x200F).contains(v) { return 0 }
+    switch v {
+    case 0x1100...0x115F, 0x2E80...0x303E, 0x3041...0x33FF, 0x3400...0x4DBF, 0x4E00...0x9FFF,
+         0xA000...0xA4CF, 0xAC00...0xD7A3, 0xF900...0xFAFF, 0xFE30...0xFE4F, 0xFF00...0xFF60,
+         0xFFE0...0xFFE6, 0x1F300...0x1F64F, 0x1F900...0x1F9FF, 0x20000...0x3FFFD:
+        return 2
+    default:
+        return 1
+    }
+}
+
 // MARK: - AudioStreamDelegate
 
 final class AudioStreamDelegate: NSObject, SCStreamOutput, @unchecked Sendable {
     // MARK: Lifecycle
 
-    init(targetFormat: AVAudioFormat, inputContinuation: AsyncStream<AnalyzerInput>.Continuation) {
+    init(targetFormat: AVAudioFormat, onBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void) {
         self.targetFormat = targetFormat
-        self.inputContinuation = inputContinuation
+        self.onBuffer = onBuffer
+    }
+
+    convenience init(targetFormat: AVAudioFormat, inputContinuation: AsyncStream<AnalyzerInput>.Continuation) {
+        self.init(targetFormat: targetFormat) { inputContinuation.yield(AnalyzerInput(buffer: $0)) }
     }
 
     // MARK: Internal
 
     let targetFormat: AVAudioFormat
-    let inputContinuation: AsyncStream<AnalyzerInput>.Continuation
+    let onBuffer: @Sendable (AVAudioPCMBuffer) -> Void
     var converter: AVAudioConverter?
+    /// Serial queue for sample buffers and silence padding.
+    let queue = DispatchQueue(label: "yap.listen.audio")
+    private var lastInputTime = DispatchTime.now()
+    private var silenceTimer: DispatchSourceTimer?
+
+    /// ScreenCaptureKit stops delivering buffers while nothing is playing, which stalls the
+    /// analyzer on the last utterance until new audio arrives. Feed silence during such gaps
+    /// so short lines are transcribed and finalized promptly.
+    func startSilencePadding(interval: Double = 0.1) {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + interval, repeating: interval)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let gap = Double(DispatchTime.now().uptimeNanoseconds - lastInputTime.uptimeNanoseconds) / 1e9
+            guard gap >= interval * 2 else { return }
+            let frames = AVAudioFrameCount(targetFormat.sampleRate * interval)
+            guard let silence = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: frames) else { return }
+            silence.frameLength = frames
+            for buffer in UnsafeMutableAudioBufferListPointer(silence.mutableAudioBufferList) {
+                if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
+            }
+            onBuffer(silence)
+            lastInputTime = lastInputTime + interval
+        }
+        silenceTimer = timer
+        timer.resume()
+    }
 
     func stream(_: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio else { return }
@@ -289,7 +432,8 @@ final class AudioStreamDelegate: NSObject, SCStreamOutput, @unchecked Sendable {
                 }
 
                 if error == nil, convertedBuffer.frameLength > 0 {
-                    inputContinuation.yield(AnalyzerInput(buffer: convertedBuffer))
+                    onBuffer(convertedBuffer)
+                    lastInputTime = .now()
                 }
             }
         } catch {
@@ -303,6 +447,7 @@ final class AudioStreamDelegate: NSObject, SCStreamOutput, @unchecked Sendable {
 enum ListenError: Swift.Error, LocalizedError {
     case screenRecordingPermissionDenied
     case noCompatibleAudioFormat
+    case unreadableVocabulary(String)
 
     // MARK: Internal
 
@@ -312,6 +457,8 @@ enum ListenError: Swift.Error, LocalizedError {
             "Screen Recording permission is required. Grant it to your terminal app in System Settings > Privacy & Security > Screen Recording, then restart the terminal."
         case .noCompatibleAudioFormat:
             "No compatible audio format available for speech recognition."
+        case let .unreadableVocabulary(path):
+            "Could not read vocabulary file at \(path)."
         }
     }
 }
