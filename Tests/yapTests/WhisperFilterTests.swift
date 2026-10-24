@@ -52,4 +52,14 @@ import Testing
         #expect(!WhisperFilter.isNearDuplicate("教えてくれ、シオン!俺達は何をすればいいんだ!?", "アテナさえも死んだ今、俺たちは…一体何を…"))
         #expect(!WhisperFilter.isNearDuplicate("はい", "いいえ"))
     }
+
+    @Test func detectsJapaneseScript() {
+        #expect(ApplePreview.hasJapanese("未来永劫"))
+        #expect(ApplePreview.hasJapanese("みらい"))
+        #expect(ApplePreview.hasJapanese("ミライ"))
+        #expect(!ApplePreview.hasJapanese("Mira, Diego"))
+        #expect(ApplePreview.hasJapanese("、。"))
+        #expect(ApplePreview.hasJapanese("ｱｲｳ"))
+        #expect(ApplePreview.hasJapanese("𠮷"))
+    }
 }

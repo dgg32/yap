@@ -116,12 +116,17 @@ final class EnergyActivity: SpeechActivity {
     /// silence still counts as silence and loud speech is never mistaken for it. Until there's a
     /// second of audio to measure, a fixed threshold is used.
     func threshold(at frame: Int) -> Float {
-        let history = 20 * 16000 / frameLength
-        let window = levels[max(0, frame - history)...frame]
-        guard window.count >= 16000 / frameLength else { return AudioLevel.silenceThreshold }
+        let second = 16000 / frameLength
+        guard frame + 1 >= second else { return AudioLevel.silenceThreshold }
         // Recomputing for every frame would be slow; the floor changes slowly, so sample it once a second
-        let bucket = frame / (16000 / frameLength)
+        let bucket = frame / second
         if let cached = thresholdCache[bucket] { return cached }
+        // Leave out digital silence (the padding injected while nothing plays), which isn't background
+        let window = levels[max(0, frame - 20 * second)...frame].filter { $0 > 0.0005 }
+        guard window.count >= second else {
+            thresholdCache[bucket] = AudioLevel.silenceThreshold
+            return AudioLevel.silenceThreshold
+        }
         let floor = window.sorted()[window.count / 10]
         let threshold = min(max(floor * 2, 0.005), 0.15)
         thresholdCache[bucket] = threshold

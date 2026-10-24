@@ -50,6 +50,13 @@ extension Listen {
         }
 
         let output = CaptionOutput(format: format, live: live, maxLength: maxLength)
+        if let translate {
+            do {
+                output.translator = try await CaptionTranslator.make(from: locale, to: translate)
+            } catch {
+                FileHandle.standardError.write(Data("\(error.localizedDescription) Continuing without translation.\n".utf8))
+            }
+        }
 
         // Apple's transcriber is small and quick to start, so it comes before the Whisper model
         var preview: ApplePreview?
@@ -96,21 +103,29 @@ extension Listen {
             skipSpecialTokens: true,
             withoutTimestamps: false
         )
-        if !vocabulary.isEmpty, let tokenizer = whisper.tokenizer {
-            // Whisper conditions on the prompt as preceding text, which biases spelling toward these terms.
-            let prompt = " " + vocabulary.joined(separator: "、")
-            options.promptTokens = Array(
-                tokenizer.encode(text: prompt)
+        // Whisper conditions on the prompt as preceding text: the vocabulary biases spelling toward its
+        // terms, and the previous line gives short utterances the context they lack on their own
+        // (未来永劫 alone can come out as "Mira, Diego").
+        let tokenizer = whisper.tokenizer
+        func tokens(_ text: String, limit: Int) -> [Int] {
+            guard let tokenizer, !text.isEmpty else { return [] }
+            return Array(
+                tokenizer.encode(text: " " + text)
                     .filter { $0 < tokenizer.specialTokens.specialTokenBegin }
-                    .suffix(200)
+                    .suffix(limit)
             )
         }
+        let vocabularyTokens = tokens(vocabulary.joined(separator: "、"), limit: 160)
+        var previousLine = ""
 
         if let header = format.header(locale: locale) {
             print(header)
         }
 
         func transcribe(_ samples: [Float]) async throws -> [TranscriptionSegment] {
+            // Only the end of the previous line matters as context, and each prompt token costs decode time
+            let prompt = vocabularyTokens + tokens(previousLine, limit: 16)
+            options.promptTokens = prompt.isEmpty ? nil : prompt
             let results = try await whisper.transcribe(audioArray: samples, decodeOptions: options)
             return results
                 .flatMap(\.segments)
@@ -130,6 +145,7 @@ extension Listen {
             guard !text.isEmpty, !WhisperFilter.isUnreliable(segment, vocabulary: vocabulary),
                   !recentFinals.contains(where: { WhisperFilter.isNearDuplicate(text, $0) }) else { return }
             recentFinals = Array((recentFinals + [text]).suffix(3))
+            previousLine = text
             let base = Double(offset) / sampleRate
             output.add(text, start: base + Double(segment.start), end: base + Double(segment.end))
         }
@@ -137,6 +153,8 @@ extension Listen {
         // Transcribe each utterance once, unless Whisper's own tentative text is the only live feedback
         let oncePerUtterance = preview != nil || !live
         var analyzedUpTo = 0
+        /// End of the last speech that was finalized, to tell when the speaker has gone quiet.
+        var lastSpeechEnd = 0
         var lastDecodedEnd = 0
         let padding = Int(sampleRate * 0.2)
 
@@ -158,7 +176,8 @@ extension Listen {
             guard let speechStart = activity.firstSpeech(in: offset..<end).map({ $0 - offset }) else {
                 // Nothing worth transcribing; keep a short tail in case speech is starting
                 audio.drop(upTo: end - Int(sampleRate * 0.3))
-                output.commit(upTo: Double(end) / sampleRate - 0.3)
+                // The current line ends once the speaker has been quiet for a while
+                await output.commit(upTo: Double(end) / sampleRate - 0.3, endsLine: end - lastSpeechEnd >= Int(sampleRate * 0.8))
                 if finished { break }
                 continue
             }
@@ -169,15 +188,31 @@ extension Listen {
                 continue
             }
 
-            // A pause ends the utterance before it, even if it fell between two decodes
-            if let pause = activity.firstPause(in: offset..<end, minimumLength: Int(sampleRate * 0.4))
-                .map({ ($0.lowerBound - offset)..<($0.upperBound - offset) }) {
+            // A pause ends the utterance before it, even if it fell between two decodes. A short utterance
+            // needs a longer pause, so a sentence isn't cut into fragments too short to transcribe well;
+            // a pause still growing at the end of the audio is checked again on the next pass.
+            var searchFrom = offset
+            var acceptedPause: Range<Int>?
+            while let pause = activity.firstPause(in: searchFrom..<end, minimumLength: Int(sampleRate * 0.4)) {
+                let utteranceLength = Double(pause.lowerBound - offset) / sampleRate
+                let pauseLength = Double(pause.count) / sampleRate
+                if finished || utteranceLength >= 3 || pauseLength >= 0.8 {
+                    acceptedPause = pause
+                    break
+                }
+                searchFrom = pause.upperBound
+            }
+            if let pause = acceptedPause.map({ ($0.lowerBound - offset)..<($0.upperBound - offset) }) {
                 let utterance = Array(samples[..<min(samples.count, pause.lowerBound + padding)])
                 for segment in try await transcribe(utterance) {
                     emitFinal(segment, offset: offset)
                 }
                 audio.drop(upTo: offset + pause.upperBound - padding)
-                output.commit(upTo: Double(offset + pause.upperBound - padding) / sampleRate)
+                lastSpeechEnd = offset + pause.lowerBound
+                await output.commit(
+                    upTo: Double(offset + pause.upperBound - padding) / sampleRate,
+                    endsLine: pause.count >= Int(sampleRate * 0.8)
+                )
                 lastDecodedEnd = 0
                 continue
             }
@@ -195,7 +230,8 @@ extension Listen {
                     emitFinal(segment, offset: offset)
                 }
                 audio.drop(upTo: offset + split)
-                output.commit(upTo: Double(offset + split) / sampleRate)
+                lastSpeechEnd = offset + split
+                await output.commit(upTo: Double(offset + split) / sampleRate, endsLine: false)
                 lastDecodedEnd = 0
                 continue
             }
@@ -213,7 +249,8 @@ extension Listen {
             if settled {
                 audio.drop(upTo: end)
                 output.whisperTentative = ""
-                output.commit(upTo: Double(end) / sampleRate)
+                lastSpeechEnd = end
+                await output.commit(upTo: Double(end) / sampleRate, endsLine: finished)
             } else {
                 output.whisperTentative = segments.dropFirst(finalCount)
                     .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -221,7 +258,8 @@ extension Listen {
                 if finalCount > 0 {
                     let committedEnd = min(offset + Int(Double(segments[finalCount - 1].end) * sampleRate), end)
                     audio.drop(upTo: committedEnd)
-                    output.commit(upTo: Double(committedEnd) / sampleRate)
+                    lastSpeechEnd = committedEnd
+                    await output.commit(upTo: Double(committedEnd) / sampleRate, endsLine: false)
                 } else {
                     output.render()
                 }
@@ -231,7 +269,7 @@ extension Listen {
         }
 
         preview?.stop()
-        output.finish()
+        await output.finish()
     }
 }
 
@@ -243,6 +281,7 @@ extension Listen {
 @MainActor
 final class CaptionOutput {
     var preview: ApplePreview?
+    var translator: CaptionTranslator?
     var whisperTentative = ""
 
     private let format: OutputFormat
@@ -268,18 +307,33 @@ final class CaptionOutput {
     /// Marks audio up to `time` as final and writes its lines, hiding the preview words they replaced.
     /// If Whisper dropped most of what Apple's transcriber heard (e.g. it hallucinated and was filtered),
     /// Apple's text is written instead.
-    func commit(upTo time: Double) {
-        let end = max(committedTime, time)
+    ///
+    /// In text output, the final text stays on the current line, with the preview's words continuing
+    /// after it, until a sentence ends: at sentence-ending punctuation, when `endsLine` (the speaker
+    /// paused for a while), or when the line grows long.
+    ///
+    /// With a translator, each line is translated once it's complete: in text output when the line
+    /// ends, so whole sentences are translated rather than halves.
+    func commit(upTo time: Double, endsLine: Bool) async {
+        let commitEnd = max(committedTime, time)
         var lines = pending
-        if let fallback = preview?.settle(pending.map(\.text).joined(), from: committedTime, to: end) {
-            lines = [(fallback, committedTime, end)]
-        }
-        for (text, start, end) in lines {
-            write(text, start: start, end: end)
+        if let fallback = preview?.settle(pending.map(\.text).joined(), from: committedTime, to: commitEnd) {
+            lines = [(fallback, committedTime, commitEnd)]
         }
         pending = []
-        committedTime = end
+        committedTime = commitEnd
+        for (index, line) in lines.enumerated() {
+            await write(line.text, start: line.start, end: line.end, endsLine: endsLine && index == lines.count - 1)
+        }
+        if endsLine, lines.isEmpty, let ended = line.endLine() {
+            await printTranslation(of: ended)
+        }
         render()
+    }
+
+    private func printTranslation(of text: String) async {
+        guard let translator, let translation = await translator.translate(text), !translation.isEmpty else { return }
+        line.printNote(translation)
     }
 
     func render() {
@@ -288,9 +342,12 @@ final class CaptionOutput {
         if text.isEmpty { line.clear() } else { line.show(text, isFinal: false) }
     }
 
-    func finish() {
+    func finish() async {
         if format == .txt {
             line.clear()
+            if let ended = line.endLine() {
+                await printTranslation(of: ended)
+            }
             print()
         } else {
             if segmentIndex > 0 { print() }
@@ -300,12 +357,22 @@ final class CaptionOutput {
         }
     }
 
-    private func write(_ text: String, start: Double, end: Double) {
+    private func write(_ text: String, start: Double, end: Double, endsLine: Bool) async {
         if format == .txt {
-            line.show(text, isFinal: true)
+            let endsSentence = text.last.map { "。！？!?…".contains($0) } ?? false
+            let endsLine = endsLine || endsSentence || line.openLength + text.count > 80
+            if let ended = line.appendFinal(text, endsLine: endsLine) {
+                await printTranslation(of: ended)
+            }
             return
         }
-        for cue in splitCaption(text, start: start, end: end, maxLength: maxLength) {
+        let cues = splitCaption(text, start: start, end: end, maxLength: maxLength)
+        // Translate the whole line, then share the translation out over its cues
+        var translations: [String?] = Array(repeating: nil, count: cues.count)
+        if let translator, let translation = await translator.translate(text) {
+            translations = splitEvenly(translation, into: cues.count)
+        }
+        for (cue, translation) in zip(cues, translations) {
             let timeRange = CMTimeRange(
                 start: CMTime(seconds: cue.start, preferredTimescale: 1000),
                 end: CMTime(seconds: cue.end, preferredTimescale: 1000)
@@ -314,10 +381,30 @@ final class CaptionOutput {
                 print(sep, terminator: "")
             }
             segmentIndex += 1
-            print(format.formatSegment(index: segmentIndex, timeRange: timeRange, text: cue.text), terminator: "")
+            print(
+                format.formatSegment(index: segmentIndex, timeRange: timeRange, text: cue.text, translation: translation),
+                terminator: ""
+            )
         }
         fflush(stdout)
     }
+}
+
+/// Splits `text` into `count` pieces of similar length at word boundaries.
+func splitEvenly(_ text: String, into count: Int) -> [String?] {
+    guard count > 1 else { return [text] }
+    let pieceLength = (text.count + count - 1) / count
+    var pieces: [String?] = splitCaption(text, start: 0, end: 1, maxLength: max(1, pieceLength)).map(\.text)
+    while pieces.count > count {
+        let last = pieces.removeLast() ?? ""
+        let previous = pieces.removeLast() ?? ""
+        let separator = previous.last?.isASCII == true && last.first?.isASCII == true ? " " : ""
+        pieces.append(previous + separator + last)
+    }
+    while pieces.count < count {
+        pieces.append(nil)
+    }
+    return pieces
 }
 
 /// Splits a caption longer than `maxLength` characters into evenly sized pieces at word boundaries
@@ -356,16 +443,40 @@ func splitCaption(
     }
 
     // Cut nearest each evenly spaced target; a boundary after punctuation wins within a few characters
-    let pieceCount = (text.count + maxLength - 1) / maxLength
-    var offsets: [Int] = [0]
-    for piece in 1..<pieceCount {
-        let target = text.count * piece / pieceCount
-        let best = cuts
-            .filter { $0.offset > offsets.last! }
-            .min { cost($0, target) < cost($1, target) }
-        if let best { offsets.append(best.offset) }
+    func cutOffsets(pieceCount: Int) -> [Int] {
+        var offsets: [Int] = [0]
+        for piece in 1..<pieceCount {
+            let target = text.count * piece / pieceCount
+            let best = cuts
+                .filter { $0.offset > offsets.last! }
+                .min { cost($0, target) < cost($1, target) }
+            if let best { offsets.append(best.offset) }
+        }
+        offsets.append(text.count)
+        return offsets
     }
-    offsets.append(text.count)
+    func fits(_ offsets: [Int]) -> Bool {
+        zip(offsets, offsets.dropFirst()).allSatisfy { $1 - $0 <= maxLength }
+    }
+
+    // Use more pieces until every piece fits; cut within a word only if no word boundary allows it
+    var pieceCount = (text.count + maxLength - 1) / maxLength
+    let mostPieces = pieceCount * 2
+    var offsets = cutOffsets(pieceCount: pieceCount)
+    while !fits(offsets), pieceCount < mostPieces {
+        pieceCount += 1
+        offsets = cutOffsets(pieceCount: pieceCount)
+    }
+    if !fits(offsets) {
+        var fitted = [0]
+        for offset in offsets.dropFirst() {
+            while offset - fitted.last! > maxLength {
+                fitted.append(fitted.last! + maxLength)
+            }
+            fitted.append(offset)
+        }
+        offsets = fitted
+    }
 
     let characters = Array(text)
     return zip(offsets, offsets.dropFirst()).compactMap { from, to in
@@ -570,8 +681,13 @@ final class ApplePreview: @unchecked Sendable {
             // Even two characters (はい, そう) are a complete reply, but filler alone (ん, っ) is not
             let previewLetters = letters(previewText)
             let previewContent = previewText.filter { !Self.isPunctuation($0) }
+            // A short Whisper line in the wrong script ("Mira, Diego" for 未来永劫) while Apple heard Japanese
+            // is a mishearing. Longer non-Japanese lines are kept: in a meeting someone may really speak English.
+            // Apple must have heard more than a short reply, or an English "OK" would become Apple's 「はい」.
+            let wrongScript = Self.hasJapanese(previewText) && !Self.hasJapanese(whisperText)
+                && letters(whisperText) <= 12 && previewLetters >= 4
             if previewLetters >= 2, !previewContent.allSatisfy(WhisperFilter.fillerCharacters.contains),
-               letters(whisperText) * 2 < previewLetters {
+               letters(whisperText) * 2 < previewLetters || wrongScript {
                 volatileConsumed = estimatedCut
                 return previewText.trimmingCharacters(in: .whitespacesAndNewlines)
             }
@@ -587,6 +703,17 @@ final class ApplePreview: @unchecked Sendable {
                 while index < characters.count, remaining > 0 {
                     if !Self.isPunctuation(characters[index]) { remaining -= 1 }
                     index += 1
+                }
+                // Better still: where Whisper's last few characters also appear in Apple's text nearby
+                let tail = Array(whisperText.filter { !Self.isPunctuation($0) }.suffix(3))
+                let lowest = max(volatileConsumed + tail.count, index - 4)
+                let highest = min(characters.count, index + 4)
+                let candidates = lowest <= highest ? Array(lowest...highest) : []
+                if tail.count == 3,
+                   let match = candidates
+                    .filter({ Array(characters[($0 - tail.count)..<$0]) == tail })
+                    .min(by: { abs($0 - index) < abs($1 - index) }) {
+                    index = match
                 }
                 let nearby = max(volatileConsumed, index - 3)..<min(characters.count, index + 3)
                 if let punctuation = nearby
@@ -612,6 +739,18 @@ final class ApplePreview: @unchecked Sendable {
             .map { $0 + 1 }
             .min { abs($0 - estimate) < abs($1 - estimate) }
         return min(snapped ?? estimate, characters.count)
+    }
+
+    /// True when `text` contains Japanese: CJK punctuation, kana (including half-width) or kanji.
+    static func hasJapanese(_ text: String) -> Bool {
+        text.unicodeScalars.contains {
+            switch $0.value {
+            case 0x3000...0x30FF, 0x3400...0x4DBF, 0x4E00...0x9FFF, 0xF900...0xFAFF, 0xFF66...0xFF9F, 0x20000...0x3FFFD:
+                true
+            default:
+                false
+            }
+        }
     }
 
     private static func isPunctuation(_ character: Character) -> Bool {

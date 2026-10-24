@@ -79,17 +79,20 @@ enum OutputFormat: String, EnumerableFlag {
         timeRange: CMTimeRange,
         text: String,
         speaker: String? = nil,
-        words: [(text: String, timeRange: CMTimeRange)]? = nil
+        words: [(text: String, timeRange: CMTimeRange)]? = nil,
+        translation: String? = nil
     ) -> String {
+        // A translation goes on its own line below the text in subtitle formats
+        let translationLine = translation.map { "\n\($0)" } ?? ""
         switch self {
         case .txt:
-            return text
+            return text + translationLine
         case .srt:
             let content = speaker.map { "\($0): \(text)" } ?? text
-            return "\(index)\n\(Self.srtTime(timeRange.start.seconds)) --> \(Self.srtTime(timeRange.end.seconds))\n\(content)"
+            return "\(index)\n\(Self.srtTime(timeRange.start.seconds)) --> \(Self.srtTime(timeRange.end.seconds))\n\(content)\(translationLine)"
         case .vtt:
             let content = speaker.map { "<v \($0)>\(text)" } ?? text
-            return "\(index)\n\(Self.vttTime(timeRange.start.seconds)) --> \(Self.vttTime(timeRange.end.seconds))\n\(content)"
+            return "\(index)\n\(Self.vttTime(timeRange.start.seconds)) --> \(Self.vttTime(timeRange.end.seconds))\n\(content)\(translationLine)"
         case .json:
             var dict: [String: Any] = [
                 "id": index,
@@ -98,6 +101,7 @@ enum OutputFormat: String, EnumerableFlag {
                 "text": text,
             ]
             if let speaker { dict["speaker"] = speaker }
+            if let translation { dict["translation"] = translation }
             if let words {
                 dict["words"] = words.map { word in
                     [

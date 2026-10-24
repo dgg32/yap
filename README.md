@@ -83,7 +83,7 @@ yap video.mp4 --json --word-timestamps -o transcript.json
 `yap listen` transcribes system audio in real time — anything playing on your computer.
 
 ```
-USAGE: yap listen [--locale <locale>] [--censor] [--txt] [--srt] [--vtt] [--json] [--max-length <max-length>] [--word-timestamps] [--fast] [--no-fast] [--vocabulary <vocabulary>] [--engine <engine>] [--whisper-model <whisper-model>] [--whisper-repo <whisper-repo>] [--vad <vad>] [--preview] [--no-preview]
+USAGE: yap listen [--locale <locale>] [--censor] [--txt] [--srt] [--vtt] [--json] [--max-length <max-length>] [--word-timestamps] [--fast] [--no-fast] [--vocabulary <vocabulary>] [--engine <engine>] [--whisper-model <whisper-model>] [--whisper-repo <whisper-repo>] [--vad <vad>] [--preview] [--no-preview] [--translate <translate>]
 
 OPTIONS:
   -l, --locale <locale>   (default: current)
@@ -117,6 +117,8 @@ OPTIONS:
   --preview/--no-preview  With --engine whisper, also run Apple's engine to stream
                           words live and to fill in lines Whisper loses.
                           (default: --preview)
+  --translate <translate> With --engine whisper, translate each final line into
+                          this language (e.g. en, zh-Hans, zh-Hant).
   -h, --help              Show help information.
 ```
 
@@ -124,7 +126,7 @@ OPTIONS:
 
 #### Live captions
 
-In the default text output, captions appear while someone is still speaking. The in-progress text is shown dimmed and redrawn in place as the transcription improves, and it's replaced by normal text once it's final. When the output is piped or redirected, only final lines are written.
+In the default text output, captions appear while someone is still speaking. The in-progress text is shown dimmed and redrawn in place as the transcription improves, and it's replaced by normal text once it's final. With `--engine whisper`, when the first part of a sentence becomes final, it stays on the line and the dimmed text continues after it; a new line starts when the sentence ends. When the output is piped or redirected, only final lines are written.
 
 With `--engine whisper`, the dimmed text comes from Apple's engine, so words appear as soon as they're heard. When the speaker pauses, Whisper's corrected sentence replaces them, usually about 1.5–2 s after the speaker stops. If Whisper's output for a stretch of audio is missing most of what Apple heard (for example because Whisper looped or recited the vocabulary and was filtered out), Apple's text is kept as the final line, so nothing is lost. This fallback also applies to SRT, VTT and JSON output and to piped text, where Apple's engine runs without showing anything live. Use `--no-preview` to use Whisper alone; on a terminal its in-progress text then updates about once a second.
 
@@ -160,7 +162,7 @@ yap listen --engine whisper -l ja-JP
 - **Other models:** `--whisper-model kotoba-whisper-v2.2` uses [kotoba-whisper](https://huggingface.co/kotoba-tech/kotoba-whisper-v2.2), a version of Whisper retrained on Japanese TV speech, via a [community Core ML conversion](https://huggingface.co/yslinear/kotoba-whisper-v2.2-coreml) (about 1.5 GB). It writes little punctuation and doesn't follow `--vocabulary` as well. Any other WhisperKit model can be loaded with `--whisper-repo <huggingface repo> --whisper-model <folder name>`.
 - **Removing it:** delete `~/Library/Application Support/yap/whisper`.
 
-Set `-l` to the language being spoken; Whisper uses its language code (`ja-JP` → Japanese). With the Whisper engine, a line becomes final after a pause of about 0.4 s. Speech and pauses are detected with [Silero VAD](https://github.com/snakers4/silero-vad), a small neural network that tells voices apart from music, noise and silence, so pauses are found under background music too and Whisper isn't run on sounds that aren't speech. Its model (under 1 MB) is downloaded on first use to `~/Library/Application Support/yap/vad`. With `--vad energy`, or if the model can't be downloaded, pauses are detected by loudness compared with the background level of the last 20 seconds instead. Speech that runs on without any pause is split at its least speech-like moment after 10 seconds.
+Set `-l` to the language being spoken; Whisper uses its language code (`ja-JP` → Japanese). With the Whisper engine, a line becomes final after a pause of about 0.4 s, or 0.8 s if it's shorter than 3 seconds, so that sentences aren't cut into fragments too short to transcribe well. Whisper is also given the previous line as context. Speech and pauses are detected with [Silero VAD](https://github.com/snakers4/silero-vad), a small neural network that tells voices apart from music, noise and silence, so pauses are found under background music too and Whisper isn't run on sounds that aren't speech. Its model (under 1 MB) is downloaded on first use to `~/Library/Application Support/yap/vad`. With `--vad energy`, or if the model can't be downloaded, pauses are detected by loudness compared with the background level of the last 20 seconds instead. Speech that runs on without any pause is split at its least speech-like moment after 10 seconds.
 
 #### Vocabulary files
 
@@ -175,6 +177,15 @@ A vocabulary file lists names and terms to expect, one per line. Blank lines and
 ```
 
 With `--engine whisper`, the list is passed to the model as a prompt, which steers it toward these spellings. This fixes most misheard character names and invented terms. A longer list adds a little time to each update, so keep it to the terms that actually come out wrong. [`seiya.txt`](seiya.txt) is an example.
+
+#### Translation
+
+With `--engine whisper`, `--translate <language>` translates each finished line using Apple's on-device translation: no network, no account. Use a language code such as `en` (English), `zh-Hans` (Simplified Chinese) or `zh-Hant` (Traditional Chinese).
+
+- **Setup:** install both languages once in System Settings > General > Language & Region > Translation Languages, for example Japanese and English. Command-line tools can't download them on their own; without them, yap says so and captions without translating.
+- **Text output:** the translation is printed in a different color under each line, once the whole sentence is final. The dimmed in-progress text isn't translated.
+- **SRT/VTT:** the translation is a second line in each cue. **JSON:** a `translation` field.
+- **Quality:** good for everyday sentences, weaker on character names and nuanced lines.
 
 #### Examples
 
@@ -196,6 +207,10 @@ yap listen --vtt > captions.vtt
 
 # Save Whisper subtitles as SRT
 yap listen -l ja-JP --engine whisper --srt > captions.srt
+
+# Japanese captions with English translations, and bilingual subtitles
+yap listen -l ja-JP --engine whisper --translate en
+yap listen -l ja-JP --engine whisper --translate zh-Hans --srt > captions.srt
 ```
 
 ### Listen and Dictate

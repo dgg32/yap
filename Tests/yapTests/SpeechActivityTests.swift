@@ -40,6 +40,16 @@ import Testing
         #expect(activity.firstPause(in: 0..<samples.count, minimumLength: sampleRate * 4 / 10) == nil)
     }
 
+    @Test func digitalSilenceDoesNotLowerTheFloor() {
+        // Music with stretches of injected digital silence: the music still counts as background
+        let music = (0..<(sampleRate * 6)).map { Float(0.05) * sin(Float($0) * 0.05) * 1.4 }
+        let silence = [Float](repeating: 0, count: sampleRate * 2)
+        let samples = music + silence + music + silence + music
+        let activity = EnergyActivity()
+        activity.add(samples[...])
+        #expect(activity.threshold(at: activity.frameCount - 1) > 0.05)
+    }
+
     @Test func positionsAreAbsolute() {
         // Analyzing in pieces gives the same answer as all at once, and ranges can start later
         let samples = timeline(speech: [3, 2], pause: 0.6, musicLevel: 0)

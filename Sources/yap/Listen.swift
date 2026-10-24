@@ -70,6 +70,19 @@ struct Listen: AsyncParsableCommand {
         help: "With --engine whisper, also run Apple's engine to stream words live and to fill in lines Whisper loses."
     ) var preview: Bool = true
 
+    @Option(
+        help: ArgumentHelp(
+            "With --engine whisper, translate each final line into this language (e.g. en, zh-Hans, zh-Hant).",
+            discussion: "Uses Apple's on-device translation. Install the languages first in System Settings > General > Language & Region > Translation Languages."
+        )
+    ) var translate: String?
+
+    func validate() throws {
+        if translate != nil, engine != .whisper {
+            throw ValidationError("--translate requires --engine whisper.")
+        }
+    }
+
     @MainActor mutating func run() async throws {
         var contextualStrings: [String] = []
         if let vocabulary {
@@ -316,36 +329,103 @@ func onInterrupt(_ shutdown: @escaping @Sendable () async -> Void) {
     }
 }
 
-/// Prints live text output: tentative text is redrawn in place (dimmed), final text ends with a newline.
-/// When stdout is not a terminal, only final text is printed.
+/// Prints live text output. A line holds final text followed by dimmed tentative text, redrawn in
+/// place as either changes. Final text can be added to a line without ending it, so the tentative
+/// text continues right after it on the same line. When stdout is not a terminal, only final text
+/// is printed, one line at a time.
 struct LiveLine {
     private let redraw = isatty(STDOUT_FILENO) != 0
-    private var tentativeRows = 0
+    /// Terminal rows the current line occupies.
+    private var rows = 0
+    /// Final text on the current line, which hasn't ended yet.
+    private var open = ""
+    private var tentative = ""
+
+    /// Number of final characters on the current line.
+    var openLength: Int { open.count }
 
     mutating func show(_ text: String, isFinal: Bool) {
-        defer { fflush(stdout) }
-        guard redraw else {
-            if isFinal { print(text) }
-            return
-        }
-        // Erase the previous tentative text, which may have wrapped over several rows:
-        // move up to its first row, return to column 0, and clear to the end of the screen.
-        if tentativeRows > 1 { print("\u{1B}[\(tentativeRows - 1)A", terminator: "") }
         if isFinal {
-            print("\r\u{1B}[J\(text)")
+            appendFinal(text, endsLine: true)
         } else {
-            print("\r\u{1B}[J\u{1B}[2m\(text)\u{1B}[0m", terminator: "")
+            tentative = text
+            draw(endingLine: false)
         }
-        tentativeRows = isFinal ? 0 : terminalRows(for: text)
     }
 
-    /// Removes any tentative text from the screen.
+    /// Adds final text to the current line, ending the line if `endsLine`. Returns the ended line's text.
+    @discardableResult
+    mutating func appendFinal(_ text: String, endsLine: Bool) -> String? {
+        // Japanese needs no space between the pieces of a line, but English words do
+        if let last = open.last, let first = text.first, last.isASCII, first.isASCII,
+           last.isLetter || last.isNumber || last.isPunctuation, first.isLetter || first.isNumber {
+            open += " "
+        }
+        open += text
+        guard endsLine else {
+            draw(endingLine: false)
+            return nil
+        }
+        let ended = open
+        tentative = ""
+        draw(endingLine: true)
+        return ended
+    }
+
+    /// Removes the tentative text, keeping the line's final text.
     mutating func clear() {
-        guard redraw, tentativeRows > 0 else { return }
-        if tentativeRows > 1 { print("\u{1B}[\(tentativeRows - 1)A", terminator: "") }
-        print("\r\u{1B}[J", terminator: "")
-        tentativeRows = 0
-        fflush(stdout)
+        guard !tentative.isEmpty else { return }
+        tentative = ""
+        draw(endingLine: false)
+    }
+
+    /// Ends the current line if it has final text. Returns the ended line's text.
+    @discardableResult
+    mutating func endLine() -> String? {
+        guard !open.isEmpty else { return nil }
+        let ended = open
+        tentative = ""
+        draw(endingLine: true)
+        return ended
+    }
+
+    /// Prints a note line (such as a translation) under the last ended line, in a different color.
+    /// The current line, if any, is drawn again below it.
+    mutating func printNote(_ note: String) {
+        defer { fflush(stdout) }
+        guard redraw else {
+            print(note)
+            return
+        }
+        if rows > 1 { print("\u{1B}[\(rows - 1)A", terminator: "") }
+        print("\r\u{1B}[J\u{1B}[36m\(note)\u{1B}[0m")
+        rows = 0
+        draw(endingLine: false)
+    }
+
+    private mutating func draw(endingLine: Bool) {
+        defer { fflush(stdout) }
+        guard redraw else {
+            if endingLine {
+                print(open)
+                open = ""
+            }
+            return
+        }
+        // Erase the line, which may have wrapped over several rows: move up to its first row,
+        // return to column 0, and clear to the end of the screen. Then draw it again.
+        if rows > 1 { print("\u{1B}[\(rows - 1)A", terminator: "") }
+        print("\r\u{1B}[J\(open)", terminator: "")
+        if !tentative.isEmpty {
+            print("\u{1B}[2m\(tentative)\u{1B}[0m", terminator: "")
+        }
+        if endingLine {
+            print()
+            open = ""
+            rows = 0
+        } else {
+            rows = open.isEmpty && tentative.isEmpty ? 0 : terminalRows(for: open + tentative)
+        }
     }
 }
 

@@ -12,7 +12,7 @@ import Testing
         let text = "もしアテナの首を取ってくるのなら、死の世界から解き放ち、永遠の命を与えよう。我らは未来永劫、逆賊のそしりを受けることになるが、それでも良いか。"
         let pieces = splitCaption(text, start: 0, end: 12, maxLength: 20)
         #expect(pieces.count > 1)
-        #expect(pieces.allSatisfy { $0.text.count <= 24 })
+        #expect(pieces.allSatisfy { $0.text.count <= 20 })
         #expect(pieces.map(\.text).joined() == text)
         #expect(pieces.first?.start == 0)
         #expect(abs((pieces.last?.end ?? 0) - 12) < 0.001)
@@ -30,6 +30,27 @@ import Testing
     @Test func splitPrefersPunctuation() {
         let pieces = splitCaption("私たちはその誘いに乗ったふりをして、この十二宮に戻ってきたのだ。", start: 0, end: 6, maxLength: 20)
         #expect(pieces.first?.text == "私たちはその誘いに乗ったふりをして、")
+    }
+
+    @Test func translationIsSharedOutOverCues() {
+        let english = "If you bring back the head of Athena, I will free you from the world of death and give you eternal life."
+        let pieces = splitEvenly(english, into: 3)
+        #expect(pieces.count == 3)
+        #expect(pieces.compactMap { $0 }.joined(separator: " ") == english)
+        #expect(splitEvenly("ハーデスを倒せ", into: 1) == ["ハーデスを倒せ"])
+        #expect(splitEvenly("短い", into: 4).count == 4)
+    }
+
+    @Test(arguments: [20, 40])
+    func maxLengthIsNeverExceeded(maxLength: Int) {
+        let latin = Array(repeating: "abcdefghij", count: 30).joined(separator: " ")
+        let japanese = "ハーデスと戦うには、アテナもクロスをまとわねば決して勝ち目はない。何としてでも、アテナにクロスをまとっていただかねばならん。"
+        let unbroken = String(repeating: "あ", count: 95)
+        for text in [latin, japanese, unbroken] {
+            let pieces = splitCaption(text, start: 0, end: 10, maxLength: maxLength)
+            #expect(pieces.allSatisfy { $0.text.count <= maxLength })
+            #expect(pieces.map(\.text).joined().filter { !$0.isWhitespace } == text.filter { !$0.isWhitespace })
+        }
     }
 
     /// Terminal columns: CJK and emoji (including those above U+1F64F) take two, variation selectors none.
