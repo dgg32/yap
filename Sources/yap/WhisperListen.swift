@@ -275,7 +275,10 @@ extension Listen {
 @MainActor
 final class CaptionOutput {
     var preview: ApplePreview?
-    var translator: CaptionTranslator?
+    /// With a translation, the original text is shown in cyan and the translation in the default color.
+    var translator: CaptionTranslator? {
+        didSet { line.finalColor = translator == nil ? nil : 36 }
+    }
     var showsReading = false
     var whisperTentative = ""
 
@@ -332,7 +335,7 @@ final class CaptionOutput {
         return JapaneseReading.hiragana(text)
     }
 
-    /// Prints the reading (yellow) and translation (cyan) of a line that just ended.
+    /// Prints the reading (yellow) and translation (default color) of a line that just ended.
     private func printNotes(for text: String) async {
         if let reading = reading(of: text) {
             line.printNote(reading, color: 33)

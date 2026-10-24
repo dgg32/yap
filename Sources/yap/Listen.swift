@@ -354,6 +354,8 @@ struct LiveLine {
     /// Final text on the current line, which hasn't ended yet.
     private var open = ""
     private var tentative = ""
+    /// ANSI color code for final text, or nil for the terminal's default color.
+    var finalColor: Int?
 
     /// Number of final characters on the current line.
     var openLength: Int { open.count }
@@ -403,17 +405,16 @@ struct LiveLine {
         return ended
     }
 
-    /// Prints a note line (such as a translation) under the last ended line, in a different color.
-    /// The current line, if any, is drawn again below it.
-    /// Prints `note` (like a translation) on its own line in `color` (an ANSI color code), above the open line.
-    mutating func printNote(_ note: String, color: Int = 36) {
+    /// Prints a note line (such as a translation) under the last ended line, in `color` (an ANSI color
+    /// code, or nil for the terminal's default color). The current line, if any, is drawn again below it.
+    mutating func printNote(_ note: String, color: Int? = nil) {
         defer { fflush(stdout) }
         guard redraw else {
             print(note)
             return
         }
         if rows > 1 { print("\u{1B}[\(rows - 1)A", terminator: "") }
-        print("\r\u{1B}[J\u{1B}[\(color)m\(note)\u{1B}[0m")
+        print("\r\u{1B}[J\(Self.colored(note, color))")
         rows = 0
         draw(endingLine: false)
     }
@@ -430,7 +431,7 @@ struct LiveLine {
         // Erase the line, which may have wrapped over several rows: move up to its first row,
         // return to column 0, and clear to the end of the screen. Then draw it again.
         if rows > 1 { print("\u{1B}[\(rows - 1)A", terminator: "") }
-        print("\r\u{1B}[J\(open)", terminator: "")
+        print("\r\u{1B}[J\(Self.colored(open, finalColor))", terminator: "")
         if !tentative.isEmpty {
             print("\u{1B}[2m\(tentative)\u{1B}[0m", terminator: "")
         }
@@ -441,6 +442,11 @@ struct LiveLine {
         } else {
             rows = open.isEmpty && tentative.isEmpty ? 0 : terminalRows(for: open + tentative)
         }
+    }
+
+    private static func colored(_ text: String, _ color: Int?) -> String {
+        guard let color, !text.isEmpty else { return text }
+        return "\u{1B}[\(color)m\(text)\u{1B}[0m"
     }
 }
 

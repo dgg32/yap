@@ -190,7 +190,7 @@ With `--engine whisper`, the list is passed to the model as a prompt, which stee
 With `--engine whisper`, `--translate <language>` translates each finished line using Apple's on-device translation: no network, no account. Use a language code such as `en` (English), `zh-Hans` (Simplified Chinese) or `zh-Hant` (Traditional Chinese).
 
 - **Setup:** install both languages once in System Settings > General > Language & Region > Translation Languages, for example Japanese and English. Command-line tools can't download them on their own; without them, yap says so and captions without translating.
-- **Text output:** the translation is printed in a different color under each line, once the whole sentence is final. The dimmed in-progress text isn't translated.
+- **Text output:** the original text is shown in cyan, and the translation is printed in the normal text color under each line, once the whole sentence is final. The dimmed in-progress text isn't translated.
 - **SRT/VTT:** the translation is a second line in each cue. **JSON:** a `translation` field.
 - **Quality:** good for everyday sentences, weaker on character names and nuanced lines.
 
