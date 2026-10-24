@@ -77,9 +77,30 @@ struct Listen: AsyncParsableCommand {
         )
     ) var translate: String?
 
+    @Flag(
+        help: "With --engine whisper, show the hiragana reading of each final line that has kanji."
+    ) var reading: Bool = false
+
+    @Option(
+        help: ArgumentHelp(
+            "Play an audio or video file through the live pipeline instead of capturing system audio.",
+            discussion: "For trying changes on the same recording. Plays in real time unless --input-speed says otherwise. MKV and other formats AVFoundation can't read need ffmpeg."
+        )
+    ) var input: String?
+
+    @Option(
+        help: "With --input, how many times faster than real time to play the file."
+    ) var inputSpeed: Double = 1
+
     func validate() throws {
         if translate != nil, engine != .whisper {
             throw ValidationError("--translate requires --engine whisper.")
+        }
+        if reading, engine != .whisper {
+            throw ValidationError("--reading requires --engine whisper.")
+        }
+        if inputSpeed <= 0 {
+            throw ValidationError("--input-speed must be greater than 0.")
         }
     }
 
@@ -132,31 +153,24 @@ struct Listen: AsyncParsableCommand {
             throw ListenError.noCompatibleAudioFormat
         }
 
-        let streamDelegate = AudioStreamDelegate(
-            targetFormat: targetFormat,
-            inputContinuation: inputContinuation
-        )
-        let stream = try await makeSystemAudioStream(format: targetFormat, delegate: streamDelegate)
+        let source = try await makeAudioSource(input: input, speed: inputSpeed, format: targetFormat) {
+            inputContinuation.yield(AnalyzerInput(buffer: $0))
+        }
 
         // Load the model up front so the first words aren't delayed
         try await analyzer.prepareToAnalyze(in: targetFormat)
 
-        do {
-            try await stream.startCapture()
-        } catch {
-            throw ListenError.screenRecordingPermissionDenied
+        let shutdown = once {
+            await source.stop()
+            inputContinuation.finish()
+            try? await analyzer.finalizeAndFinishThroughEndOfInput()
         }
-        streamDelegate.startSilencePadding()
+        try await source.start(onEnd: shutdown)
 
         // Start the analyzer with streaming input
         try await analyzer.start(inputSequence: inputSequence)
 
-        nonisolated(unsafe) let streamToStop = stream
-        onInterrupt {
-            try? await streamToStop.stopCapture()
-            inputContinuation.finish()
-            try? await analyzer.finalizeAndFinishThroughEndOfInput()
-        }
+        onInterrupt(shutdown)
 
         // Stream results as they arrive
         let format = outputFormat
@@ -391,14 +405,15 @@ struct LiveLine {
 
     /// Prints a note line (such as a translation) under the last ended line, in a different color.
     /// The current line, if any, is drawn again below it.
-    mutating func printNote(_ note: String) {
+    /// Prints `note` (like a translation) on its own line in `color` (an ANSI color code), above the open line.
+    mutating func printNote(_ note: String, color: Int = 36) {
         defer { fflush(stdout) }
         guard redraw else {
             print(note)
             return
         }
         if rows > 1 { print("\u{1B}[\(rows - 1)A", terminator: "") }
-        print("\r\u{1B}[J\u{1B}[36m\(note)\u{1B}[0m")
+        print("\r\u{1B}[J\u{1B}[\(color)m\(note)\u{1B}[0m")
         rows = 0
         draw(endingLine: false)
     }
@@ -558,6 +573,7 @@ enum ListenError: Swift.Error, LocalizedError {
     case screenRecordingPermissionDenied
     case noCompatibleAudioFormat
     case unreadableVocabulary(String)
+    case unreadableInput(String, reason: String)
 
     // MARK: Internal
 
@@ -569,6 +585,8 @@ enum ListenError: Swift.Error, LocalizedError {
             "No compatible audio format available for speech recognition."
         case let .unreadableVocabulary(path):
             "Could not read vocabulary file at \(path)."
+        case let .unreadableInput(path, reason):
+            "Could not read \(path). \(reason)"
         }
     }
 }

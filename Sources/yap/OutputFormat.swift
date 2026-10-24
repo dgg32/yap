@@ -80,19 +80,20 @@ enum OutputFormat: String, EnumerableFlag {
         text: String,
         speaker: String? = nil,
         words: [(text: String, timeRange: CMTimeRange)]? = nil,
+        reading: String? = nil,
         translation: String? = nil
     ) -> String {
-        // A translation goes on its own line below the text in subtitle formats
-        let translationLine = translation.map { "\n\($0)" } ?? ""
+        // A reading and a translation each go on their own line below the text in subtitle formats
+        let noteLines = [reading, translation].compactMap { $0.map { "\n\($0)" } }.joined()
         switch self {
         case .txt:
-            return text + translationLine
+            return text + noteLines
         case .srt:
             let content = speaker.map { "\($0): \(text)" } ?? text
-            return "\(index)\n\(Self.srtTime(timeRange.start.seconds)) --> \(Self.srtTime(timeRange.end.seconds))\n\(content)\(translationLine)"
+            return "\(index)\n\(Self.srtTime(timeRange.start.seconds)) --> \(Self.srtTime(timeRange.end.seconds))\n\(content)\(noteLines)"
         case .vtt:
             let content = speaker.map { "<v \($0)>\(text)" } ?? text
-            return "\(index)\n\(Self.vttTime(timeRange.start.seconds)) --> \(Self.vttTime(timeRange.end.seconds))\n\(content)\(translationLine)"
+            return "\(index)\n\(Self.vttTime(timeRange.start.seconds)) --> \(Self.vttTime(timeRange.end.seconds))\n\(content)\(noteLines)"
         case .json:
             var dict: [String: Any] = [
                 "id": index,
@@ -101,6 +102,7 @@ enum OutputFormat: String, EnumerableFlag {
                 "text": text,
             ]
             if let speaker { dict["speaker"] = speaker }
+            if let reading { dict["reading"] = reading }
             if let translation { dict["translation"] = translation }
             if let words {
                 dict["words"] = words.map { word in

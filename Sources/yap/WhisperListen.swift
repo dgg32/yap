@@ -31,23 +31,16 @@ extension Listen {
         // Start capturing first, so speech during the (possibly long) model load is buffered, not lost
         let audio = PendingAudio()
         let previewInput = PreviewInput()
-        let streamDelegate = AudioStreamDelegate(targetFormat: targetFormat) { buffer in
+        let source = try await makeAudioSource(input: input, speed: inputSpeed, format: targetFormat) { buffer in
             audio.append(buffer)
             previewInput.feed(buffer)
         }
-        let stream = try await makeSystemAudioStream(format: targetFormat, delegate: streamDelegate)
-        do {
-            try await stream.startCapture()
-        } catch {
-            throw ListenError.screenRecordingPermissionDenied
-        }
-        streamDelegate.startSilencePadding()
-
-        nonisolated(unsafe) let streamToStop = stream
-        onInterrupt {
-            try? await streamToStop.stopCapture()
+        let shutdown = once {
+            await source.stop()
             audio.finish()
         }
+        try await source.start(onEnd: shutdown)
+        onInterrupt(shutdown)
 
         let output = CaptionOutput(format: format, live: live, maxLength: maxLength)
         if let translate {
@@ -70,7 +63,7 @@ extension Listen {
                     Task { @MainActor in output.render() }
                 }
                 // Catch it up on the audio captured so far, then feed it live, keeping both timelines aligned
-                streamDelegate.queue.sync {
+                source.queue.sync {
                     previewInput.attach(started, replaying: audio.snapshot().samples, format: targetFormat)
                 }
                 preview = started
@@ -79,6 +72,7 @@ extension Listen {
             }
         }
         output.preview = preview
+        output.showsReading = reading
 
         let activity: SpeechActivity
         if vad == .silero {
@@ -282,6 +276,7 @@ extension Listen {
 final class CaptionOutput {
     var preview: ApplePreview?
     var translator: CaptionTranslator?
+    var showsReading = false
     var whisperTentative = ""
 
     private let format: OutputFormat
@@ -326,12 +321,22 @@ final class CaptionOutput {
             await write(line.text, start: line.start, end: line.end, endsLine: endsLine && index == lines.count - 1)
         }
         if endsLine, lines.isEmpty, let ended = line.endLine() {
-            await printTranslation(of: ended)
+            await printNotes(for: ended)
         }
         render()
     }
 
-    private func printTranslation(of text: String) async {
+    /// The reading of `text`, if it's shown and differs from the text.
+    private func reading(of text: String) -> String? {
+        guard showsReading, JapaneseReading.hasKanji(text) else { return nil }
+        return JapaneseReading.hiragana(text)
+    }
+
+    /// Prints the reading (yellow) and translation (cyan) of a line that just ended.
+    private func printNotes(for text: String) async {
+        if let reading = reading(of: text) {
+            line.printNote(reading, color: 33)
+        }
         guard let translator, let translation = await translator.translate(text), !translation.isEmpty else { return }
         line.printNote(translation)
     }
@@ -346,7 +351,7 @@ final class CaptionOutput {
         if format == .txt {
             line.clear()
             if let ended = line.endLine() {
-                await printTranslation(of: ended)
+                await printNotes(for: ended)
             }
             print()
         } else {
@@ -362,7 +367,7 @@ final class CaptionOutput {
             let endsSentence = text.last.map { "。！？!?…".contains($0) } ?? false
             let endsLine = endsLine || endsSentence || line.openLength + text.count > 80
             if let ended = line.appendFinal(text, endsLine: endsLine) {
-                await printTranslation(of: ended)
+                await printNotes(for: ended)
             }
             return
         }
@@ -382,7 +387,13 @@ final class CaptionOutput {
             }
             segmentIndex += 1
             print(
-                format.formatSegment(index: segmentIndex, timeRange: timeRange, text: cue.text, translation: translation),
+                format.formatSegment(
+                    index: segmentIndex,
+                    timeRange: timeRange,
+                    text: cue.text,
+                    reading: reading(of: cue.text),
+                    translation: translation
+                ),
                 terminator: ""
             )
         }

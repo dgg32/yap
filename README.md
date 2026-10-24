@@ -83,7 +83,7 @@ yap video.mp4 --json --word-timestamps -o transcript.json
 `yap listen` transcribes system audio in real time — anything playing on your computer.
 
 ```
-USAGE: yap listen [--locale <locale>] [--censor] [--txt] [--srt] [--vtt] [--json] [--max-length <max-length>] [--word-timestamps] [--fast] [--no-fast] [--vocabulary <vocabulary>] [--engine <engine>] [--whisper-model <whisper-model>] [--whisper-repo <whisper-repo>] [--vad <vad>] [--preview] [--no-preview] [--translate <translate>]
+USAGE: yap listen [--locale <locale>] [--censor] [--txt] [--srt] [--vtt] [--json] [--max-length <max-length>] [--word-timestamps] [--fast] [--no-fast] [--vocabulary <vocabulary>] [--engine <engine>] [--whisper-model <whisper-model>] [--whisper-repo <whisper-repo>] [--vad <vad>] [--preview] [--no-preview] [--translate <translate>] [--reading] [--input <input>] [--input-speed <input-speed>]
 
 OPTIONS:
   -l, --locale <locale>   (default: current)
@@ -119,6 +119,13 @@ OPTIONS:
                           (default: --preview)
   --translate <translate> With --engine whisper, translate each final line into
                           this language (e.g. en, zh-Hans, zh-Hant).
+  --reading               With --engine whisper, show the hiragana reading of
+                          each final line that has kanji.
+  --input <input>         Play an audio or video file through the live pipeline
+                          instead of capturing system audio.
+  --input-speed <input-speed>
+                          With --input, how many times faster than real time to
+                          play the file. (default: 1.0)
   -h, --help              Show help information.
 ```
 
@@ -186,6 +193,26 @@ With `--engine whisper`, `--translate <language>` translates each finished line 
 - **Text output:** the translation is printed in a different color under each line, once the whole sentence is final. The dimmed in-progress text isn't translated.
 - **SRT/VTT:** the translation is a second line in each cue. **JSON:** a `translation` field.
 - **Quality:** good for everyday sentences, weaker on character names and nuanced lines.
+
+#### Readings
+
+With `--engine whisper`, `--reading` shows each final line again in hiragana, for example 「経緯をご説明して」 as 「けいいをごせつめいして」. The reading comes from macOS's own Japanese dictionary, with no download. Only lines with kanji get one.
+
+- **Text output:** the reading is printed in yellow under the line once it ends, above the translation when `--translate` is used.
+- **SRT/VTT:** the reading is a line below the text in each cue. **JSON:** a `reading` field.
+- **Accuracy:** names and words with several readings can come out wrong: 一輝 (かずき) as いっき, 派遣の方 (かた) as ほう. A misheard word gets the reading of what was misheard.
+
+#### Testing on a recording
+
+`--input <file>` plays an audio or video file through the same live pipeline in place of system audio, so you can compare settings (engine, model, vocabulary) on the same clip. No Screen Recording permission is needed. It plays in real time, so the captions come out as they would live; `--input-speed 2` plays twice as fast, which leaves Whisper less time per line and can change where lines are split. Formats AVFoundation can't read, such as MKV, are decoded with [ffmpeg](https://ffmpeg.org) (`brew install ffmpeg`).
+
+Results can still vary a little between runs, as they do live: Apple's live text and where lines are cut depend on timing.
+
+```bash
+# Compare a vocabulary file against none on the same episode
+yap listen -l ja-JP --engine whisper --input ep01.mkv --vocabulary seiya.txt > with.txt
+yap listen -l ja-JP --engine whisper --input ep01.mkv > without.txt
+```
 
 #### Examples
 
@@ -299,6 +326,27 @@ With only the Command Line Tools installed (no Xcode), SwiftPM doesn't find the 
 ```bash
 swift test -Xswiftc -plugin-path -Xswiftc /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing
 ```
+
+#### Measuring caption accuracy
+
+[scripts/caption_cer.py](scripts/caption_cer.py) plays clips through `yap listen --input` and scores the captions against a video's subtitles by character error rate (CER). Cut the clips from the video first, noting where each starts and ends:
+
+```bash
+ffmpeg -ss 06:23 -to 08:41 -i episode.mkv -vn -ac 1 -ar 16000 clip1.wav
+```
+
+Then score one or more configurations on them (by default `apple` and `whisper`):
+
+```bash
+scripts/caption_cer.py --reference episode.srt \
+    --clip clip1.wav 06:23 08:41 --clip clip2.wav 10:45 12:13 \
+    --config whisper="--engine whisper" --config kotoba="--engine whisper --whisper-model kotoba-whisper-v2.2" \
+    --repeat 2
+```
+
+It prints a table of substitutions, deletions, insertions and CER per run, and saves each run's captions and a list of its errors (`…[reference → heard]…`) in `results/` next to the reference. `--no-run` rescores saved captions without running yap again.
+
+Before comparing, speaker names and sound descriptions in （…）, cues marked （外国語）, repeated cues, punctuation and spaces are removed. TV captions shorten speech, and a word written in kana in one text and kanji in the other (しかた / 仕方) counts as an error, so no configuration scores 0%. The numbers are for comparing configurations with each other.
 
 ### MCP Server
 
