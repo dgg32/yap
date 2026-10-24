@@ -1,0 +1,38 @@
+diff --git a/Sources/yap/Listen.swift b/Sources/yap/Listen.swift
+index c9ac618..7621df2 100644
+--- a/Sources/yap/Listen.swift
++++ b/Sources/yap/Listen.swift
+@@ -55,7 +55,7 @@ struct Listen: AsyncParsableCommand {
+         let transcriber = SpeechTranscriber(
+             locale: locale,
+             transcriptionOptions: censor ? [.etiquetteReplacements] : [],
+-            reportingOptions: [],
++            reportingOptions: [.volatileResults],
+             attributeOptions: outputFormat.needsAudioTimeRange ? [.audioTimeRange] : []
+         )
+         let modules: [any SpeechModule] = [transcriber]
+@@ -189,10 +189,12 @@ struct Listen: AsyncParsableCommand {
+         if format == .txt {
+             for try await result in transcriber.results {
+                 let text = String(result.text.characters)
+-                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+-                    print(text, terminator: "")
+-                    fflush(stdout)
+-                }
++                    .trimmingCharacters(in: .whitespacesAndNewlines)
++                guard !text.isEmpty else { continue }
++                // \r returns to the start of the line, ESC[2K clears it.
++                // Tentative text is redrawn in place; the final text gets a newline.
++                print("\r\u{1B}[2K\(text)", terminator: result.isFinal ? "\n" : "")
++                fflush(stdout)
+             }
+             print()
+         } else {
+@@ -202,6 +204,7 @@ struct Listen: AsyncParsableCommand {
+             let includeWords = wordTimestamps
+             var segmentIndex = 0
+             for try await result in transcriber.results {
++                guard result.isFinal else { continue }
+                 for chunk in result.text.splitAtTimeGaps(threshold: 1.5) {
+                     let allWords = includeWords ? chunk.wordTimestamps() : nil
+                     for sentence in chunk.sentences(maxLength: sentenceMaxLength) {
