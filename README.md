@@ -40,6 +40,24 @@ brew install yap
 mint install finnvoor/yap
 ```
 
+#### Build from source
+
+The Homebrew and Mint packages install the upstream release, which doesn't include this fork's Whisper engine, live captions or vocabulary files. To get them, build from source (requires macOS 26 and Xcode 26 or its Command Line Tools):
+
+```bash
+git clone https://github.com/dgg32/yap.git
+cd yap
+swift build -c release
+```
+
+The binary is `.build/release/yap`. Run it from there, or copy it onto your `PATH`:
+
+```bash
+sudo cp .build/release/yap /usr/local/bin/yap
+```
+
+Run `swift build -c release` again after pulling changes.
+
 ### Examples
 
 #### Transcribe a YouTube video using yap and [yt-dlp](https://github.com/yt-dlp/yt-dlp)
@@ -77,7 +95,7 @@ yap video.mp4 --json --word-timestamps -o transcript.json
 `yap listen` transcribes system audio in real time — anything playing on your computer.
 
 ```
-USAGE: yap listen [--locale <locale>] [--censor] [--txt] [--srt] [--vtt] [--json] [--max-length <max-length>] [--word-timestamps]
+USAGE: yap listen [--locale <locale>] [--censor] [--txt] [--srt] [--vtt] [--json] [--max-length <max-length>] [--word-timestamps] [--fast] [--no-fast] [--vocabulary <vocabulary>] [--engine <engine>] [--whisper-model <whisper-model>]
 
 OPTIONS:
   -l, --locale <locale>   (default: current)
@@ -88,10 +106,72 @@ OPTIONS:
                           Maximum sentence length in characters for timed output
                           formats. (default: 40)
   --word-timestamps       Include word-level timestamps in JSON output.
+  --fast/--no-fast        Favor responsiveness over accuracy. Use --no-fast for
+                          more accurate but slower results. (default: --fast)
+  --vocabulary <vocabulary>
+                          Path to a text file of names and terms to expect, one
+                          per line (lines starting with # are ignored).
+  --engine <engine>       Speech recognition engine: apple (on-device Speech
+                          framework) or whisper (WhisperKit, more accurate).
+                          (values: apple, whisper; default: apple)
+  --whisper-model <whisper-model>
+                          WhisperKit model variant used with --engine whisper.
+                          Downloaded on first use. (default:
+                          openai_whisper-large-v3-v20240930)
   -h, --help              Show help information.
 ```
 
-> Screen Recording permission is required. Grant it to your terminal app in System Settings > Privacy & Security > Screen Recording.
+> Screen Recording permission is required. Grant it to your terminal app in System Settings > Privacy & Security > Screen Recording, then restart the terminal.
+
+#### Live captions
+
+In the default text output, captions appear while someone is still speaking. The current line is redrawn in place as the transcription improves, and it moves to a new line once it's final. When the output is piped or redirected, only final lines are written.
+
+#### Engines
+
+| | `--engine apple` (default) | `--engine whisper` |
+|---|---|---|
+| Model | Apple Speech framework, built into macOS | OpenAI Whisper large-v3-turbo via [WhisperKit](https://github.com/argmaxinc/WhisperKit) |
+| Setup | Language assets download automatically | ~1.6 GB model download on first run |
+| Captions | Word by word, very responsive | Updated about once a second, final after a short pause |
+| Accuracy | Good | Better, especially for names and non-English speech |
+| `--vocabulary` | Accepted, but has little visible effect | Steers spelling of the listed terms |
+| `--fast`, `--censor`, `--word-timestamps` | Supported | Ignored |
+
+#### Setting up Whisper
+
+There is nothing to install separately. The first time you run with `--engine whisper`, yap downloads the model from Hugging Face with a progress bar:
+
+```bash
+yap listen --engine whisper -l ja-JP
+```
+
+- **Download:** about 1.6 GB, stored in `~/Library/Application Support/yap/whisper`. Later runs work offline.
+- **First load:** after the download, yap prints "Loading Whisper model…". The first load can take a minute or two while macOS optimizes the model for your chip. It's faster after that, but macOS may redo this after a system update.
+- **Hardware:** an Apple Silicon Mac. The default model uses about 2–3 GB of memory. On a Mac with 8 GB of memory, use the smaller model:
+
+  ```bash
+  yap listen --engine whisper --whisper-model openai_whisper-large-v3-v20240930_turbo_632MB
+  ```
+
+  Other models are listed at [argmaxinc/whisperkit-coreml](https://huggingface.co/argmaxinc/whisperkit-coreml).
+- **Removing it:** delete `~/Library/Application Support/yap/whisper`.
+
+Set `-l` to the language being spoken; Whisper uses its language code (`ja-JP` → Japanese). With the Whisper engine, a line becomes final after about 0.6 s of quiet. Scenes with continuous background music have fewer quiet gaps, so lines there may take longer to become final.
+
+#### Vocabulary files
+
+A vocabulary file lists names and terms to expect, one per line. Blank lines and lines starting with `#` are ignored:
+
+```
+# Saint Seiya terms
+アテナ
+ハーデス
+聖闘士
+十二宮
+```
+
+With `--engine whisper`, the list is passed to the model as a prompt, which steers it toward these spellings. This fixes most misheard character names and invented terms. A longer list adds a little time to each update, so keep it to the terms that actually come out wrong. [`seiya.txt`](seiya.txt) is an example.
 
 #### Examples
 
@@ -99,11 +179,20 @@ OPTIONS:
 # Transcribe system audio live
 yap listen
 
-# Pipe live transcription to another tool
+# Live Japanese captions with Whisper and a vocabulary file
+yap listen -l ja-JP --engine whisper --vocabulary seiya.txt
+
+# Apple engine, trading some speed for accuracy
+yap listen -l ja-JP --no-fast
+
+# Pipe live transcription to another tool (only final lines are sent)
 yap listen | uvx llm 'Translate this to French:'
 
 # Save system audio as VTT subtitles
 yap listen --vtt > captions.vtt
+
+# Save Whisper subtitles as SRT
+yap listen -l ja-JP --engine whisper --srt > captions.srt
 ```
 
 ### Listen and Dictate
