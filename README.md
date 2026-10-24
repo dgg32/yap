@@ -28,21 +28,7 @@ OPTIONS:
 
 ### Installation
 
-#### Homebrew
-
-```bash
-brew install yap
-```
-
-#### Mint
-
-```bash
-mint install finnvoor/yap
-```
-
-#### Build from source
-
-The Homebrew and Mint packages install the upstream release, which doesn't include this fork's Whisper engine, live captions or vocabulary files. To get them, build from source (requires macOS 26 and Xcode 26 or its Command Line Tools):
+This is a fork of [finnvoor/yap](https://github.com/finnvoor/yap) that adds a Whisper engine, live captions and vocabulary files to `yap listen`. It isn't published to Homebrew or Mint, so build it from source. You need macOS 26 and Xcode 26 or its Command Line Tools.
 
 ```bash
 git clone https://github.com/dgg32/yap.git
@@ -56,7 +42,9 @@ The binary is `.build/release/yap`. Run it from there, or copy it onto your `PAT
 sudo cp .build/release/yap /usr/local/bin/yap
 ```
 
-Run `swift build -c release` again after pulling changes.
+To update, run `git pull` and `swift build -c release` again, then repeat the copy if you installed it to `/usr/local/bin`.
+
+> `brew install yap` and `mint install finnvoor/yap` install the original yap, without this fork's features. If you have one of them installed, uninstall it, or make sure `which yap` points to this build.
 
 ### Examples
 
