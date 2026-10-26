@@ -5,7 +5,8 @@ and the Whisper engine. The target workload is
 `yap listen -l ja-JP --engine whisper --vocabulary seiya.txt`: live Japanese captions of an anime
 with background music.
 
-Four review rounds so far (2026-10-24 to 2026-10-26). This file lists what is **still open**,
+Four review rounds so far (2026-10-24 to 2026-10-26), plus a latency round measured on four
+clips of an NHK drama (8.8 minutes of dialogue, with reference subtitles). This file lists what is **still open**,
 then a one-line record of what was fixed, then what was checked and is *not* a bug. The full
 write-ups of fixed findings, with their measurements, are in git history (`git log -p BUG.md`).
 
@@ -22,11 +23,8 @@ Nothing High is open.
 |---|---|---|---|
 | [A3](#a3) | Medium | Quality · filters | A line said twice in a row is dropped as a Whisper loop |
 | [J4](#j4) | Medium | Quality · alignment | Volatile preview text is still cut by counting characters; kanji vs kana can shift the cut |
-| [L7](#l7) | Medium | Latency · startup | `prewarm: false`: the first decode of a session pays for Core ML specialisation |
 | [S4](#s4) | Medium | Quality · filters | The filters can't be turned off, and the confidence thresholds are tuned for English |
 | [L2](#l2) | Low | Latency | Speech with no pause gets no final text for 10 s |
-| [L6](#l6) | Low | Latency · compute | The text decoder stays on the Neural Engine; the GPU hasn't been measured |
-| [P1](#p1) | Low | Latency · translation | The translation is awaited in the caption loop: ~25 ms + 2 ms/char, once per ended line |
 | [A5](#a5) | Low | Quality · output | Text output and subtitle output read and translate different units (also R10) |
 | [A6](#a6) | Low | Quality · translation | A cue can end up with no translation when the translation is short |
 | [R7](#r7) | Low | Output | With `--reading` and `--translate`, an SRT cue has three lines; many players show two |
@@ -64,15 +62,6 @@ Not re-measured since the tail match was added. To fix it properly, prefer the t
 estimate `settle` already computes (`estimatedCut`) and use character counting only to refine
 it.
 
-<a id="l7"></a>
-### L7 — Medium: `prewarm: false`
-
-`WhisperModelStore.load` passes `prewarm: false`. After an OS update, Core ML specialises the
-models for the chip on first use, and without a prewarm that cost lands on the first caption
-rather than at load time. WhisperKit documents the trade-off as "load time will be multiplied
-by 2". For a live captioning tool, a slower start is better than a slow first caption. Measure
-both on a fresh specialisation before switching.
-
 <a id="s4"></a>
 ### S4 — Medium: the filters aren't configurable
 
@@ -89,27 +78,6 @@ With the preview running, an utterance is cut at a detected pause, and only afte
 is none. The Silero VAD finds pauses under music, so this only affects genuinely continuous
 speech. The README documents it. Kept as a known trade-off: cutting earlier gives Whisper less
 context.
-
-<a id="l6"></a>
-### L6 — Low: the text decoder stays on the Neural Engine
-
-`ModelComputeOptions(audioEncoderCompute: .cpuAndGPU)` moves only the encoder. The default model
-has a 4-layer decoder, so this matters less than it would for full large-v3. Worth a single
-measurement with `textDecoderCompute: .cpuAndGPU`.
-
-<a id="p1"></a>
-### P1 — Low: the translation is awaited in the caption loop
-
-`CaptionOutput` awaits `translator.translate` when a line *ends* (text output) or once per
-Whisper line (subtitle output), so translation doesn't run on every 100 ms tick. Measured cost is
-~25 ms + 2 ms per character: a 30–40 character line stalls the loop for 70–105 ms, once per
-sentence. Round 2's "doubles the caption latency" overstated it. The model load on the first
-request (163–524 ms) is now done at start-up (`CaptionTranslator.make` translates a dummy
-string).
-
-Moving translation off the critical path would remove the remaining stall. It needs care: a
-note printed late lands under whatever line is current, so translations must be queued in order
-and printed before the next line ends.
 
 <a id="a5"></a>
 ### A5 / R10 — Low: text and subtitle output use different units
@@ -181,7 +149,7 @@ the shortcuts instead.
 <a id="s7"></a>
 ### S7 — Low: tests in CI
 
-`Tests/yapTests/` has 27 tests in 5 suites, all passing. But `.github/workflows/Release.yml`
+`Tests/yapTests/` has 29 tests in 6 suites, all passing. But `.github/workflows/Release.yml`
 only builds on tags and doesn't run them. `ApplePreview.settle`, where J4 lives, has no tests
 because it needs a live `SpeechAnalyzer`. Extracting its cut logic into a pure function would
 make it testable.
@@ -192,6 +160,10 @@ make it testable.
 
 | ID | Round | Was | Fix |
 |---|---|---|---|
+| Latency | 5 | A final line appeared a median **1.6 s** after its speech ended: ~0.85 s waiting for the pause to be confirmed, then ~0.75 s of decoding | **Speculative decoding:** Whisper starts once the speaker has been quiet for 0.2 s, and the result is used when the pause is confirmed (128 of 130 lines). Median **1.6 s → 1.05 s**, with the same CER (8.2 % → 7.9 %, within run-to-run noise). About a quarter of speculative decodes are thrown away because the speaker went on. |
+| Latency | 5 | Temperature fallbacks (up to 3 extra decodes) made the slowest lines take 3–5 s | `temperatureFallbackCount: 1`. The same CER (7.9 %), and lines over 2 s went from 6 of 130 to 3 (one of them is L2's 10 s split). |
+| P1 | 5 | The translation was awaited in the caption loop | Translations are printed under their line when they arrive (text output) or written by an ordered queue (subtitles), so the captions don't wait. Only a line ending while the previous translation is still in flight waits for it, which keeps each translation under its own line. Measured with `--translate en`: translation added **40 ms** per line before and **17 ms** after. Round 2's "70–105 ms, doubles the latency" was far too high: it was measured cold, and drama lines are short. Verified in text, SRT and terminal output. |
+| Tooling | 5 | No way to see where the latency goes | `YAP_DEBUG_TIMING=1` reports the wait, decode and fallbacks for each line, plus a summary (README, Development). |
 | R1 | 4 | The Apple preview was never finalized: the trailing text was lost at the end of `--input` and on Ctrl+C | `ApplePreview.flush()` finalizes the analyzer and waits for its last results, called as soon as the input ends and before the last commit. Verified: a clip ending in 「そうだぞ」 loses it before the fix and keeps it after, and so does a session interrupted mid-word. |
 | R2 | 4 | Whisper returned nothing for utterances ≤ 1 s. Round 3 blamed the model, but the cause is WhisperKit's `windowClipTime` (default 1.0 s): its decode loop `while seek < end - windowClipTime` never runs for ≤ 1 s of audio | `DecodingOptions(windowClipTime: 0.2)`. Verified: 「はい」 (0.43 s), 「そうだぞ」 (0.81 s) and 「アテナよ」 (0.77 s) get no caption before the fix and the right one after, even with `--no-preview`. |
 | — | 4 | Found while fixing R2: Whisper can put a short segment's end past the audio it was given, so cues overlapped (はい 2.94–4.94 vs the next cue at 4.22) | Segment ends are clamped to the length of the decoded audio. |
@@ -269,6 +241,16 @@ Recorded so they aren't re-investigated.
   じゅうにぐう, at 0.5 ms per line.
 * **AVFoundation doesn't truncate `--input` files.** 48 kHz and 44.1 kHz stereo both decode to
   the full length.
+* **Latency round, measured and rejected** (four drama clips, CER against the broadcast subtitles):
+  * *Text decoder on the GPU (old L6):* decode times are the same as on the Neural Engine
+    (median 0.74–0.84 s either way). It stays on the Neural Engine.
+  * *A 0.6 s pause for short utterances instead of 0.8 s:* saves 0.15 s, but CER rises from
+    8.2 % to 9.9 % as sentences get cut into fragments.
+  * *`prewarm: true` (old L7):* prewarming loads every model twice on *every* start, while Core ML
+    specialisation only happens once after an OS update. That's a bad trade for a tool that's
+    started often, so it stays `false`. (It can't be measured on an already specialised model.)
+  * *Temperature fallbacks as the main cost:* they're rare (1–3 lines per clip). Reducing them
+    helps the worst case, not the median.
 * **`windowClipTime: 0.2` doesn't change longer utterances.** It only decides whether WhisperKit
   starts another 30 s window near the end of the audio. Utterances here are under 30 s, so the
   first window always covers the whole utterance; the only difference is that audio of 0.2–1 s
