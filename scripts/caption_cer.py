@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# dependencies = ["pykakasi"]
+# dependencies = ["pykakasi", "rapidfuzz"]
 # ///
 """Score `yap listen` captions against reference subtitles by character error rate (CER).
 
@@ -22,7 +22,7 @@ side and kanji on the other (しかた / 仕方) counts as an error. Reading CER
 hiragana (by pykakasi), so such spellings match, but so do homophones heard wrong (経緯 / 敬意).
 The real rate lies between the two.
 
-Run it with uv, which installs pykakasi on first use: `scripts/caption_cer.py …` or `uv run scripts/caption_cer.py …`.
+Run it with uv, which installs pykakasi and rapidfuzz on first use: `scripts/caption_cer.py …` or `uv run scripts/caption_cer.py …`.
 """
 
 import argparse
@@ -35,6 +35,7 @@ import unicodedata
 from pathlib import Path
 
 import pykakasi
+from rapidfuzz.distance import Levenshtein
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -96,34 +97,16 @@ def hypothesis_text(path):
 
 def align(reference, hypothesis):
     """Edit operations turning reference into hypothesis: a list of (kind, ref_char, hyp_char)."""
-    n, m = len(reference), len(hypothesis)
-    previous_row = list(range(m + 1))
-    rows = [previous_row]
-    for i in range(1, n + 1):
-        row = [i] + [0] * m
-        r = reference[i - 1]
-        for j in range(1, m + 1):
-            row[j] = min(
-                previous_row[j - 1] + (r != hypothesis[j - 1]),
-                previous_row[j] + 1,
-                row[j - 1] + 1,
-            )
-        rows.append(row)
-        previous_row = row
     operations = []
-    i, j = n, m
-    while i > 0 or j > 0:
-        if i > 0 and j > 0 and rows[i][j] == rows[i - 1][j - 1] + (reference[i - 1] != hypothesis[j - 1]):
-            kind = "=" if reference[i - 1] == hypothesis[j - 1] else "S"
-            operations.append((kind, reference[i - 1], hypothesis[j - 1]))
-            i, j = i - 1, j - 1
-        elif i > 0 and rows[i][j] == rows[i - 1][j] + 1:
-            operations.append(("D", reference[i - 1], ""))
-            i -= 1
+    for tag, i1, i2, j1, j2 in Levenshtein.opcodes(reference, hypothesis):
+        if tag == "delete":
+            operations += [("D", reference[i], "") for i in range(i1, i2)]
+        elif tag == "insert":
+            operations += [("I", "", hypothesis[j]) for j in range(j1, j2)]
         else:
-            operations.append(("I", "", hypothesis[j - 1]))
-            j -= 1
-    return operations[::-1]
+            kind = "=" if tag == "equal" else "S"
+            operations += [(kind, reference[i], hypothesis[j]) for i, j in zip(range(i1, i2), range(j1, j2))]
+    return operations
 
 
 def differences(operations, context=4):
@@ -181,7 +164,12 @@ def main():
     configs = []
     for spec in args.config or ["apple=", "whisper=--engine whisper"]:
         name, _, options = spec.partition("=")
-        configs.append((name, shlex.split(options)))
+        options = shlex.split(options)
+        # Their extra lines in each cue would be scored as part of the transcription
+        for option in ("--reading", "--translate"):
+            if any(o == option or o.startswith(option + "=") for o in options):
+                sys.exit(f"--config {name}: {option} adds lines to the captions that would count as errors; leave it out.")
+        configs.append((name, options))
     cues = read_srt(args.reference)
     out = Path(args.out) if args.out else Path(args.reference).parent / "results"
     out.mkdir(parents=True, exist_ok=True)

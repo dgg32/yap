@@ -102,6 +102,10 @@ struct Listen: AsyncParsableCommand {
         if inputSpeed <= 0 {
             throw ValidationError("--input-speed must be greater than 0.")
         }
+        // Before anything is set up, so a mistyped path isn't reported as some other problem
+        if let input, !FileManager.default.fileExists(atPath: input) {
+            throw ListenError.unreadableInput(input, reason: "No such file.")
+        }
     }
 
     @MainActor mutating func run() async throws {
@@ -357,8 +361,8 @@ struct LiveLine {
     /// ANSI color code for final text, or nil for the terminal's default color.
     var finalColor: Int?
 
-    /// Number of final characters on the current line.
-    var openLength: Int { open.count }
+    /// Terminal columns the final text on the current line takes.
+    var openWidth: Int { displayWidth(of: open) }
 
     mutating func show(_ text: String, isFinal: Bool) {
         if isFinal {
@@ -454,8 +458,12 @@ struct LiveLine {
 func terminalRows(for text: String) -> Int {
     var size = winsize()
     let columns = ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col > 0 ? Int(size.ws_col) : 80
-    let width = text.unicodeScalars.reduce(0) { $0 + displayWidth(of: $1) }
-    return max(1, (width + columns - 1) / columns)
+    return max(1, (displayWidth(of: text) + columns - 1) / columns)
+}
+
+/// Terminal columns `text` takes, counting East Asian wide characters as two.
+func displayWidth(of text: String) -> Int {
+    text.unicodeScalars.reduce(0) { $0 + displayWidth(of: $1) }
 }
 
 func displayWidth(of scalar: Unicode.Scalar) -> Int {

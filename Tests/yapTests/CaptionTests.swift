@@ -56,6 +56,13 @@ import Testing
     /// Terminal columns: CJK and emoji (including those above U+1F64F) take two, variation selectors none.
     @Test(arguments: [("あいう", 6), ("漢字", 4), ("abc", 3), ("🔥🚀🚲🩰", 8), ("🇯🇵", 4), ("❤\u{FE0F}", 1)])
     func displayWidth(text: String, columns: Int) {
-        #expect(text.unicodeScalars.reduce(0) { $0 + yap.displayWidth(of: $1) } == columns)
+        #expect(yap.displayWidth(of: text) == columns)
+    }
+
+    /// The live line breaks at 80 columns, so 40 Japanese characters already fill it.
+    @Test func lineWidthCountsColumns() {
+        var line = LiveLine()
+        line.appendFinal(String(repeating: "聖", count: 40), endsLine: false)
+        #expect(line.openWidth == 80)
     }
 }

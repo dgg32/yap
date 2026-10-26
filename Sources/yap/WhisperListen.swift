@@ -95,7 +95,11 @@ extension Listen {
             usePrefillPrompt: true,
             detectLanguage: locale.language.languageCode == nil,
             skipSpecialTokens: true,
-            withoutTimestamps: false
+            withoutTimestamps: false,
+            // WhisperKit skips the last second of the audio (1 s by default) to avoid hallucinating at
+            // the end of long recordings, so an utterance of a second or less was never decoded at all.
+            // Each utterance here ends at a detected pause, so there's no ragged end to protect.
+            windowClipTime: 0.2
         )
         // Whisper conditions on the prompt as preceding text: the vocabulary biases spelling toward its
         // terms, and the previous line gives short utterances the context they lack on their own
@@ -133,7 +137,8 @@ extension Listen {
         }
 
         var recentFinals: [String] = []
-        func emitFinal(_ segment: TranscriptionSegment, offset: Int) {
+        /// `length` is the number of samples that were transcribed, from `offset`.
+        func emitFinal(_ segment: TranscriptionSegment, offset: Int, length: Int) {
             let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
             // A line nearly identical to a recent one is Whisper looping or re-reading the same audio
             guard !text.isEmpty, !WhisperFilter.isUnreliable(segment, vocabulary: vocabulary),
@@ -141,7 +146,10 @@ extension Listen {
             recentFinals = Array((recentFinals + [text]).suffix(3))
             previousLine = text
             let base = Double(offset) / sampleRate
-            output.add(text, start: base + Double(segment.start), end: base + Double(segment.end))
+            // For a short utterance Whisper can place the end well past the audio it was given (its
+            // window is padded to 30 s), overlapping the next line
+            let end = base + min(Double(segment.end), Double(length) / sampleRate)
+            output.add(text, start: min(base + Double(segment.start), end), end: end)
         }
 
         // Transcribe each utterance once, unless Whisper's own tentative text is the only live feedback
@@ -151,9 +159,16 @@ extension Listen {
         var lastSpeechEnd = 0
         var lastDecodedEnd = 0
         let padding = Int(sampleRate * 0.2)
+        var previewFlushed = false
 
         while true {
             let (samples, offset, finished) = audio.snapshot()
+            if finished, !previewFlushed {
+                // Apple's transcriber holds back its text for the last words until its input ends;
+                // get it before the final commit, which may need it as the fallback
+                await preview?.flush()
+                previewFlushed = true
+            }
             let end = offset + samples.count
             if end > analyzedUpTo {
                 activity.add(samples[max(0, analyzedUpTo - offset)...])
@@ -199,7 +214,7 @@ extension Listen {
             if let pause = acceptedPause.map({ ($0.lowerBound - offset)..<($0.upperBound - offset) }) {
                 let utterance = Array(samples[..<min(samples.count, pause.lowerBound + padding)])
                 for segment in try await transcribe(utterance) {
-                    emitFinal(segment, offset: offset)
+                    emitFinal(segment, offset: offset, length: utterance.count)
                 }
                 audio.drop(upTo: offset + pause.upperBound - padding)
                 lastSpeechEnd = offset + pause.lowerBound
@@ -221,7 +236,7 @@ extension Listen {
                     in: (offset + Int(sampleRate * 4))..<min(end - Int(sampleRate * 1), offset + Int(sampleRate * 25))
                 ) - offset
                 for segment in try await transcribe(Array(samples[..<split])) {
-                    emitFinal(segment, offset: offset)
+                    emitFinal(segment, offset: offset, length: split)
                 }
                 audio.drop(upTo: offset + split)
                 lastSpeechEnd = offset + split
@@ -237,7 +252,7 @@ extension Listen {
             let finalCount = settled ? segments.count : max(0, segments.count - 1)
 
             for segment in segments.prefix(finalCount) {
-                emitFinal(segment, offset: offset)
+                emitFinal(segment, offset: offset, length: samples.count)
             }
 
             if settled {
@@ -368,7 +383,8 @@ final class CaptionOutput {
     private func write(_ text: String, start: Double, end: Double, endsLine: Bool) async {
         if format == .txt {
             let endsSentence = text.last.map { "。！？!?…".contains($0) } ?? false
-            let endsLine = endsLine || endsSentence || line.openLength + text.count > 80
+            // 80 columns, not characters: a Japanese character takes two
+            let endsLine = endsLine || endsSentence || line.openWidth + displayWidth(of: text) > 80
             if let ended = line.appendFinal(text, endsLine: endsLine) {
                 await printNotes(for: ended)
             }
@@ -630,6 +646,13 @@ final class ApplePreview: @unchecked Sendable {
         if error == nil, converted.frameLength > 0 {
             input.yield(AnalyzerInput(buffer: converted))
         }
+    }
+
+    /// Ends the input and waits for the transcriber's final results for the audio it was given.
+    func flush() async {
+        input.finish()
+        try? await analyzer.finalizeAndFinishThroughEndOfInput()
+        await resultsTask?.value
     }
 
     func stop() {

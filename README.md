@@ -344,7 +344,7 @@ scripts/caption_cer.py --reference episode.srt \
     --repeat 2
 ```
 
-It prints a table of substitutions, deletions, insertions and CER per run, and saves each run's captions and a list of its errors (`…[reference → heard]…`) in `results/` next to the reference. `--no-run` rescores saved captions without running yap again.
+It prints a table of substitutions, deletions, insertions and CER per run, and saves each run's captions and a list of its errors (`…[reference → heard]…`) in `results/` next to the reference. `--no-run` rescores saved captions without running yap again. A configuration can't include `--reading` or `--translate`, whose extra lines would be scored as errors.
 
 Before comparing, speaker names and sound descriptions in （…）, cues marked （外国語）, repeated cues, punctuation and spaces are removed. TV captions shorten speech, and a word written in kana in one text and kanji in the other (しかた / 仕方) counts as an error, so no configuration scores 0%. The numbers are for comparing configurations with each other.
 
