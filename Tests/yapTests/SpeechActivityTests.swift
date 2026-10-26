@@ -112,3 +112,32 @@ import Testing
         #expect(activity.firstSpeech(in: 0..<samples.count) == nil)
     }
 }
+
+/// Speech decisions given frame by frame: "s" speech, "-" silence, "?" undecided.
+final class ScriptedActivity: SpeechActivity {
+    let frameLength = 1
+    private let frames: [Bool?]
+    init(_ script: String) {
+        frames = script.map { $0 == "s" ? true : $0 == "-" ? false : nil }
+    }
+    var frameCount: Int { frames.count }
+    func add(_ samples: ArraySlice<Float>) {}
+    func isSpeech(frame: Int) -> Bool? { frames[frame] }
+    func level(frame: Int) -> Float { frames[frame] == true ? 1 : 0 }
+}
+
+@Suite struct TrailingSilenceTests {
+    /// Speculative transcription is only reused if the pause it guessed starts where the confirmed one does.
+    @Test(arguments: ["sss----", "ss-ss?---", "sss?????--", "-ss---"])
+    func startsWherePauseWillBeConfirmed(script: String) {
+        let activity = ScriptedActivity(script)
+        let silence = activity.trailingSilence(in: 0..<script.count)
+        #expect(silence != nil)
+        #expect(silence == activity.firstPause(in: 0..<script.count, minimumLength: 2)?.lowerBound)
+    }
+
+    @Test(arguments: ["ssss", "sss-s", "----", "ss???"])
+    func noPauseAtTheEnd(script: String) {
+        #expect(ScriptedActivity(script).trailingSilence(in: 0..<script.count) == nil)
+    }
+}

@@ -65,6 +65,14 @@ extension SpeechActivity {
         return nil
     }
 
+    /// Start of the silence after the last speech in `range`, if it lasts to the end of the analyzed
+    /// audio: a pause that may still be growing. Matches the start `firstPause` would report for it.
+    func trailingSilence(in range: Range<Int>) -> Int? {
+        let frames = frames(in: range)
+        guard let lastSpeech = frames.last(where: { isSpeech(frame: $0) == true }) else { return nil }
+        return frames[(lastSpeech + 1)...].first { isSpeech(frame: $0) == false }.map { $0 * frameLength }
+    }
+
     /// Middle of the least speech-like 300 ms within `range`, the best place to split speech without a pause.
     func quietestPoint(in range: Range<Int>) -> Int {
         let frames = Array(frames(in: range))

@@ -41,6 +41,7 @@ extension Listen {
         }
         try await source.start(onEnd: shutdown)
         onInterrupt(shutdown)
+        let timing = DebugTiming.isEnabled ? DebugTiming(sampleRate: sampleRate, speed: input == nil ? 1 : inputSpeed) : nil
 
         let output = CaptionOutput(format: format, live: live, maxLength: maxLength)
         if let translate {
@@ -91,7 +92,9 @@ extension Listen {
             task: .transcribe,
             language: locale.language.languageCode?.identifier,
             temperature: 0,
-            temperatureFallbackCount: 3,
+            // A fallback decodes the audio again; more than one rarely helps and made the slowest
+            // lines take 3–4 s (measured on four drama clips: the same CER with 1 as with 3)
+            temperatureFallbackCount: 1,
             usePrefillPrompt: true,
             detectLanguage: locale.language.languageCode == nil,
             skipSpecialTokens: true,
@@ -124,7 +127,9 @@ extension Listen {
             // Only the end of the previous line matters as context, and each prompt token costs decode time
             let prompt = vocabularyTokens + tokens(previousLine, limit: 16)
             options.promptTokens = prompt.isEmpty ? nil : prompt
+            timing?.decodeBegan()
             let results = try await whisper.transcribe(audioArray: samples, decodeOptions: options)
+            timing?.decodeEnded(temperatures: results.flatMap(\.segments).map(\.temperature))
             return results
                 .flatMap(\.segments)
                 .map { segment in
@@ -160,6 +165,8 @@ extension Listen {
         var lastDecodedEnd = 0
         let padding = Int(sampleRate * 0.2)
         var previewFlushed = false
+        /// A transcription of the utterance ending at `speechEnd`, made before its pause was confirmed.
+        var speculative: (speechEnd: Int, length: Int, segments: [TranscriptionSegment])?
 
         while true {
             let (samples, offset, finished) = audio.snapshot()
@@ -213,7 +220,16 @@ extension Listen {
             }
             if let pause = acceptedPause.map({ ($0.lowerBound - offset)..<($0.upperBound - offset) }) {
                 let utterance = Array(samples[..<min(samples.count, pause.lowerBound + padding)])
-                for segment in try await transcribe(utterance) {
+                let segments: [TranscriptionSegment]
+                if let speculative, speculative.speechEnd == offset + pause.lowerBound, speculative.length == utterance.count {
+                    segments = speculative.segments
+                    timing?.speculationUsed()
+                } else {
+                    if speculative != nil { timing?.speculationWasted() }
+                    segments = try await transcribe(utterance)
+                }
+                speculative = nil
+                for segment in segments {
                     emitFinal(segment, offset: offset, length: utterance.count)
                 }
                 audio.drop(upTo: offset + pause.upperBound - padding)
@@ -222,7 +238,20 @@ extension Listen {
                     upTo: Double(offset + pause.upperBound - padding) / sampleRate,
                     endsLine: pause.count >= Int(sampleRate * 0.8)
                 )
+                timing?.lineWritten(speechEnd: offset + pause.lowerBound, audioLength: utterance.count, reason: "pause")
                 lastDecodedEnd = 0
+                continue
+            }
+
+            // The speaker may have stopped: transcribe now, while the pause is confirmed, and use the
+            // result if it is. If speech resumes instead, the result is thrown away.
+            if !finished, let silence = activity.trailingSilence(in: offset..<end),
+               end - silence >= Int(sampleRate * 0.2), speculative?.speechEnd != silence {
+                if speculative != nil { timing?.speculationWasted() }
+                let utterance = Array(samples[..<min(samples.count, silence - offset + padding)])
+                speculative = (silence, utterance.count, try await transcribe(utterance))
+                // Check again soon: the pause may be confirmed by now
+                lastDecodedEnd = end - Int(sampleRate * 0.2)
                 continue
             }
 
@@ -241,6 +270,7 @@ extension Listen {
                 audio.drop(upTo: offset + split)
                 lastSpeechEnd = offset + split
                 await output.commit(upTo: Double(offset + split) / sampleRate, endsLine: false)
+                timing?.lineWritten(speechEnd: offset + split, audioLength: split, reason: "split")
                 lastDecodedEnd = 0
                 continue
             }
@@ -279,6 +309,7 @@ extension Listen {
 
         preview?.stop()
         await output.finish()
+        timing?.summary()
     }
 }
 
@@ -306,6 +337,12 @@ final class CaptionOutput {
     private var committedTime = 0.0
     /// Whisper's final lines for the audio since the last commit.
     private var pending: [(text: String, start: Double, end: Double)] = []
+    /// Prints the translation of the last ended text line under it once it arrives. Translating takes
+    /// ~25 ms + 2 ms per character, so the captions carry on meanwhile; only the next line's end waits
+    /// for it, so that each translation lands under its own line.
+    private var note: Task<Void, Never>?
+    /// Writes subtitle cues in order, each once its translation is ready, without holding up the captions.
+    private var writing: Task<Void, Never>?
 
     init(format: OutputFormat, live: Bool, maxLength: Int) {
         self.format = format
@@ -326,7 +363,8 @@ final class CaptionOutput {
     /// paused for a while), or when the line grows long.
     ///
     /// With a translator, each line is translated once it's complete: in text output when the line
-    /// ends, so whole sentences are translated rather than halves.
+    /// ends, so whole sentences are translated rather than halves. Translations are printed when they
+    /// arrive, so they don't delay the captions.
     func commit(upTo time: Double, endsLine: Bool) async {
         let commitEnd = max(committedTime, time)
         var lines = pending
@@ -338,8 +376,9 @@ final class CaptionOutput {
         for (index, line) in lines.enumerated() {
             await write(line.text, start: line.start, end: line.end, endsLine: endsLine && index == lines.count - 1)
         }
-        if endsLine, lines.isEmpty, let ended = line.endLine() {
-            await printNotes(for: ended)
+        if endsLine, lines.isEmpty, line.openWidth > 0 {
+            await note?.value
+            if let ended = line.endLine() { printNotes(for: ended) }
         }
         render()
     }
@@ -350,13 +389,17 @@ final class CaptionOutput {
         return JapaneseReading.hiragana(text)
     }
 
-    /// Prints the reading (yellow) and translation (default color) of a line that just ended.
-    private func printNotes(for text: String) async {
+    /// Prints the reading (yellow) of a line that just ended, and its translation (default color) once
+    /// it arrives. Await `note` before ending another line.
+    private func printNotes(for text: String) {
         if let reading = reading(of: text) {
             line.printNote(reading, color: 33)
         }
-        guard let translator, let translation = await translator.translate(text), !translation.isEmpty else { return }
-        line.printNote(translation)
+        guard let translator else { return }
+        note = Task {
+            guard let translation = await translator.translate(text), !translation.isEmpty else { return }
+            line.printNote(translation)
+        }
     }
 
     func render() {
@@ -368,11 +411,14 @@ final class CaptionOutput {
     func finish() async {
         if format == .txt {
             line.clear()
+            await note?.value
             if let ended = line.endLine() {
-                await printNotes(for: ended)
+                printNotes(for: ended)
+                await note?.value
             }
             print()
         } else {
+            await writing?.value
             if segmentIndex > 0 { print() }
             if let footer = format.footer {
                 print(footer)
@@ -385,11 +431,20 @@ final class CaptionOutput {
             let endsSentence = text.last.map { "。！？!?…".contains($0) } ?? false
             // 80 columns, not characters: a Japanese character takes two
             let endsLine = endsLine || endsSentence || line.openWidth + displayWidth(of: text) > 80
+            if endsLine { await note?.value }
             if let ended = line.appendFinal(text, endsLine: endsLine) {
-                await printNotes(for: ended)
+                printNotes(for: ended)
             }
             return
         }
+        let previous = writing
+        writing = Task {
+            await previous?.value
+            await writeCues(text, start: start, end: end)
+        }
+    }
+
+    private func writeCues(_ text: String, start: Double, end: Double) async {
         let cues = splitCaption(text, start: start, end: end, maxLength: maxLength)
         // Translate the whole line, then share the translation out over its cues
         var translations: [String?] = Array(repeating: nil, count: cues.count)
@@ -1049,6 +1104,7 @@ enum WhisperModelStore {
             modelFolder: folder.path,
             tokenizerFolder: downloadBase,
             // The GPU runs the audio encoder faster than the Neural Engine on M-series Macs (~0.4 s vs ~1 s per decode)
+            // The text decoder is as fast on the Neural Engine as on the GPU (measured), so it stays there
             computeOptions: ModelComputeOptions(audioEncoderCompute: .cpuAndGPU),
             verbose: false,
             logLevel: .error,

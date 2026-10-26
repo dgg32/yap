@@ -169,7 +169,7 @@ yap listen --engine whisper -l ja-JP
 - **Other models:** `--whisper-model kotoba-whisper-v2.2` uses [kotoba-whisper](https://huggingface.co/kotoba-tech/kotoba-whisper-v2.2), a version of Whisper retrained on Japanese TV speech, via a [community Core ML conversion](https://huggingface.co/yslinear/kotoba-whisper-v2.2-coreml) (about 1.5 GB). It writes little punctuation and doesn't follow `--vocabulary` as well. Any other WhisperKit model can be loaded with `--whisper-repo <huggingface repo> --whisper-model <folder name>`.
 - **Removing it:** delete `~/Library/Application Support/yap/whisper`.
 
-Set `-l` to the language being spoken; Whisper uses its language code (`ja-JP` → Japanese). With the Whisper engine, a line becomes final after a pause of about 0.4 s, or 0.8 s if it's shorter than 3 seconds, so that sentences aren't cut into fragments too short to transcribe well. Whisper is also given the previous line as context. Speech and pauses are detected with [Silero VAD](https://github.com/snakers4/silero-vad), a small neural network that tells voices apart from music, noise and silence, so pauses are found under background music too and Whisper isn't run on sounds that aren't speech. Its model (under 1 MB) is downloaded on first use to `~/Library/Application Support/yap/vad`. With `--vad energy`, or if the model can't be downloaded, pauses are detected by loudness compared with the background level of the last 20 seconds instead. Speech that runs on without any pause is split at its least speech-like moment after 10 seconds.
+Set `-l` to the language being spoken; Whisper uses its language code (`ja-JP` → Japanese). With the Whisper engine, a line becomes final after a pause of about 0.4 s, or 0.8 s if it's shorter than 3 seconds, so that sentences aren't cut into fragments too short to transcribe well. Whisper starts transcribing as soon as the speaker has been quiet for 0.2 s, so the line is usually ready when the pause is confirmed, about a second after the speech ends; if the speaker goes on, that result is thrown away. Whisper is also given the previous line as context. Speech and pauses are detected with [Silero VAD](https://github.com/snakers4/silero-vad), a small neural network that tells voices apart from music, noise and silence, so pauses are found under background music too and Whisper isn't run on sounds that aren't speech. Its model (under 1 MB) is downloaded on first use to `~/Library/Application Support/yap/vad`. With `--vad energy`, or if the model can't be downloaded, pauses are detected by loudness compared with the background level of the last 20 seconds instead. Speech that runs on without any pause is split at its least speech-like moment after 10 seconds.
 
 #### Vocabulary files
 
@@ -325,6 +325,14 @@ With only the Command Line Tools installed (no Xcode), SwiftPM doesn't find the 
 
 ```bash
 swift test -Xswiftc -plugin-path -Xswiftc /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing
+```
+
+#### Measuring caption latency
+
+With `YAP_DEBUG_TIMING=1`, `yap listen --engine whisper` reports on stderr how long each final line took after its speech ended, split into waiting for the pause and Whisper's decode (with any temperature fallbacks), and a summary at the end:
+
+```bash
+YAP_DEBUG_TIMING=1 yap listen -l ja-JP --engine whisper --input clip.wav --srt > /dev/null
 ```
 
 #### Measuring caption accuracy
