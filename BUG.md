@@ -30,6 +30,7 @@ Nothing High is open.
 | [R7](#r7) | Low | Output | With `--reading` and `--translate`, an SRT cue has three lines; many players show two |
 | [R11](#r11) | Low | Memory | `--input` decodes the whole file into memory (≈96 MB for 25 minutes) |
 | [R12](#r12) | Low | Quality · VAD | With `--vad energy`, dialogue quieter than 2× the music bed isn't detected (old N1/N2) |
+| [L9](#l9) | Medium | Quality | Reported: long lines occasionally go missing. Not reproduced yet |
 | [R13](#r13) | Low | Output | Whisper's timestamps for a very short utterance are short: a 0.4 s 「はい」 becomes a 0.2 s cue |
 | [B4](#b4) | Low | Translation | The translation source language always comes from `--locale` |
 | [S1](#s1) | Low | Suggestion | Show which model was resolved; make the "No models found" error friendlier |
@@ -120,6 +121,31 @@ speechPeak=0.17 musicPeak=0.10  threshold=0.1135  MISSED
 The same threshold also finds false pauses in the dips of continuous speech without music. The
 fix is two thresholds: a more sensitive one (≈ `floor * 1.2`) for speech, and the current one
 for pauses.
+
+<a id="l9"></a>
+### L9 — Medium: long lines occasionally go missing (reported, not reproduced)
+
+Seen in live use (anime with background music, `--vocabulary`, `--translate`). Checked on
+2026-10-27 without reproducing it:
+
+* **Four drama clips** (text output, `--translate en`): the longest stretch of the broadcast
+  subtitles missing from the captions is 6–7 characters (short replies). Every line the filters
+  dropped was decoded noise (「またね」「バイオー」).
+* **Eight real 12–21 s lines**, clean and over a music bed with loud stings: 87–99 % of every
+  line's characters reached the captions, and nothing was filtered.
+* **Ruled out:** the compression-ratio filter. WhisperKit compresses token IDs rather than text,
+  but real dialogue stays under 2.4 at any length (maximum 2.21 over 1 000 deduplicated lines).
+
+**Fixed along the way:** WhisperKit gives every segment the *window's* confidence and compression
+ratio, so one unclear stretch could get every line of a long utterance dropped. Segments are now
+judged on their own tokens (drops on the four clips 32 → 14, the same CER). WhisperKit's
+confidence is also numerically unreliable on noise: window averages of −10.86 = ln(1/51 866),
+a uniform guess over the whole vocabulary, which an argmax token can't score.
+
+**Still possible in live use:** Silero hearing no speech under loud music (that audio is discarded
+untranscribed, and only Apple's text can cover it), or Apple's fallback arriving in fragments
+(「すみ」, 「ませ」). `YAP_DEBUG_FILTERS=1` tells these apart. Next step: a log or a recording of a
+scene where it happens.
 
 <a id="r13"></a>
 ### R13 — Low: very short utterances get very short cues

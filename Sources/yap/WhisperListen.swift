@@ -130,15 +130,35 @@ extension Listen {
             timing?.decodeBegan()
             let results = try await whisper.transcribe(audioArray: samples, decodeOptions: options)
             timing?.decodeEnded(temperatures: results.flatMap(\.segments).map(\.temperature))
+            if results.flatMap(\.segments).isEmpty {
+                DebugFilters.dropped("", reason: String(format: "Whisper returned nothing for %.1f s of audio", Double(samples.count) / sampleRate))
+            }
             return results
                 .flatMap(\.segments)
                 .map { segment in
                     // A character split across tokens can decode as U+FFFD
                     var segment = segment
                     segment.text = segment.text.replacingOccurrences(of: "\u{FFFD}", with: "")
+                    // WhisperKit gives every segment the confidence and compression ratio of the whole
+                    // decode, so one unclear stretch got every line of a long utterance dropped. Judge
+                    // each segment on its own tokens instead.
+                    let logProbs = segment.tokenLogProbs.flatMap(\.values)
+                    if !logProbs.isEmpty {
+                        segment.avgLogprob = logProbs.reduce(0, +) / Float(logProbs.count)
+                    }
+                    if let tokenizer {
+                        let textTokens = segment.tokens.filter { $0 < tokenizer.specialTokens.specialTokenBegin }
+                        if !textTokens.isEmpty {
+                            segment.compressionRatio = TextUtilities.compressionRatio(of: textTokens)
+                        }
+                    }
                     return segment
                 }
-                .filter { !WhisperFilter.isLikelyHallucination($0) }
+                .filter {
+                    guard WhisperFilter.isLikelyHallucination($0) else { return true }
+                    DebugFilters.dropped($0.text, reason: "hallucination or filler")
+                    return false
+                }
         }
 
         var recentFinals: [String] = []
@@ -146,8 +166,15 @@ extension Listen {
         func emitFinal(_ segment: TranscriptionSegment, offset: Int, length: Int) {
             let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
             // A line nearly identical to a recent one is Whisper looping or re-reading the same audio
-            guard !text.isEmpty, !WhisperFilter.isUnreliable(segment, vocabulary: vocabulary),
-                  !recentFinals.contains(where: { WhisperFilter.isNearDuplicate(text, $0) }) else { return }
+            guard !text.isEmpty else { return }
+            if let reason = WhisperFilter.unreliability(of: segment, vocabulary: vocabulary) {
+                DebugFilters.dropped(text, reason: reason)
+                return
+            }
+            if let recent = recentFinals.first(where: { WhisperFilter.isNearDuplicate(text, $0) }) {
+                DebugFilters.dropped(text, reason: "near-duplicate of 「\(recent)」")
+                return
+            }
             recentFinals = Array((recentFinals + [text]).suffix(3))
             previousLine = text
             let base = Double(offset) / sampleRate
@@ -369,6 +396,7 @@ final class CaptionOutput {
         let commitEnd = max(committedTime, time)
         var lines = pending
         if let fallback = preview?.settle(pending.map(\.text).joined(), from: committedTime, to: commitEnd) {
+            DebugFilters.replaced(pending.map(\.text).joined(), with: fallback)
             lines = [(fallback, committedTime, commitEnd)]
         }
         pending = []
@@ -959,10 +987,20 @@ enum WhisperFilter {
     /// reciting the vocabulary prompt. Only applied to final text: tentative guesses on partial speech
     /// are often low-confidence, and hiding them would delay the captions.
     static func isUnreliable(_ segment: TranscriptionSegment, vocabulary: [String] = []) -> Bool {
+        unreliability(of: segment, vocabulary: vocabulary) != nil
+    }
+
+    /// Why `isUnreliable` is true for `segment`, or nil.
+    static func unreliability(of segment: TranscriptionSegment, vocabulary: [String] = []) -> String? {
         let content = letters(segment.text)
-        if segment.noSpeechProb > 0.6, content.count <= 4 || segment.avgLogprob < -1 { return true }
-        if segment.avgLogprob < -1.2 || segment.compressionRatio > 2.4 { return true }
-        return hasRepeatedPhrase(content) || recitesVocabulary(content, vocabulary: vocabulary)
+        if segment.noSpeechProb > 0.6, content.count <= 4 || segment.avgLogprob < -1 {
+            return String(format: "no speech (noSpeechProb %.2f, avgLogprob %.2f)", segment.noSpeechProb, segment.avgLogprob)
+        }
+        if segment.avgLogprob < -1.2 { return String(format: "low confidence (avgLogprob %.2f)", segment.avgLogprob) }
+        if segment.compressionRatio > 2.4 { return String(format: "compression ratio %.2f", segment.compressionRatio) }
+        if hasRepeatedPhrase(content) { return "repeated phrase" }
+        if recitesVocabulary(content, vocabulary: vocabulary) { return "recites the vocabulary" }
+        return nil
     }
 
     /// True when a phrase of 2–20 characters repeats back to back for at least 20 characters, making up

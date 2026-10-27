@@ -76,3 +76,22 @@ final class DebugTiming {
         ).utf8))
     }
 }
+
+// MARK: - DebugFilters
+
+/// With `YAP_DEBUG_FILTERS=1`, reports on stderr each Whisper line that was dropped and why, and each
+/// time Apple's transcriber supplied the text instead.
+enum DebugFilters {
+    static let isEnabled = ProcessInfo.processInfo.environment["YAP_DEBUG_FILTERS"] == "1"
+
+    static func dropped(_ text: String, reason: String) {
+        guard isEnabled else { return }
+        FileHandle.standardError.write(Data("[filter] dropped (\(reason)): \(text)\n".utf8))
+    }
+
+    static func replaced(_ whisperText: String, with previewText: String) {
+        guard isEnabled else { return }
+        let whisper = whisperText.isEmpty ? "nothing" : "「\(whisperText)」"
+        FileHandle.standardError.write(Data("[filter] Apple's text used, Whisper had \(whisper): \(previewText)\n".utf8))
+    }
+}

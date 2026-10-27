@@ -335,6 +335,14 @@ With `YAP_DEBUG_TIMING=1`, `yap listen --engine whisper` reports on stderr how l
 YAP_DEBUG_TIMING=1 yap listen -l ja-JP --engine whisper --input clip.wav --srt > /dev/null
 ```
 
+#### Finding out why a line is missing
+
+With `YAP_DEBUG_FILTERS=1`, yap reports on stderr every Whisper line it drops and why (low confidence, a loop, a hallucination, a near-duplicate of a recent line), every decode that returned nothing, and every time Apple's transcriber supplied the text instead:
+
+```bash
+YAP_DEBUG_FILTERS=1 yap listen -l ja-JP --engine whisper --vocabulary seiya.txt --translate en 2> filters.log
+```
+
 #### Measuring caption accuracy
 
 [scripts/caption_cer.py](scripts/caption_cer.py) plays clips through `yap listen --input` and scores the captions against a video's subtitles by character error rate (CER). Cut the clips from the video first, noting where each starts and ends:
