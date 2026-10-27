@@ -54,13 +54,11 @@ extension AttributedString {
         let tokenizer = NLTokenizer(unit: .sentence)
         let string = String(characters)
         tokenizer.string = string
-        let sentenceRanges = tokenizer.tokens(for: string.startIndex..<string.endIndex).map {
-            (
-                $0,
-                AttributedString.Index($0.lowerBound, within: self)!
-                    ..<
-                    AttributedString.Index($0.upperBound, within: self)!
-            )
+        // A range that doesn't map onto the attributed string is skipped rather than crashing
+        let sentenceRanges = tokenizer.tokens(for: string.startIndex..<string.endIndex).compactMap { range in
+            AttributedString.Index(range.lowerBound, within: self).flatMap { start in
+                AttributedString.Index(range.upperBound, within: self).map { (range, start..<$0) }
+            }
         }
         let ranges = sentenceRanges.flatMap { sentenceStringRange, sentenceRange in
             let sentence = self[sentenceRange]
@@ -70,10 +68,10 @@ extension AttributedString {
 
             let wordTokenizer = NLTokenizer(unit: .word)
             wordTokenizer.string = string
-            var wordRanges = wordTokenizer.tokens(for: sentenceStringRange).map {
-                AttributedString.Index($0.lowerBound, within: self)!
-                    ..<
-                    AttributedString.Index($0.upperBound, within: self)!
+            var wordRanges = wordTokenizer.tokens(for: sentenceStringRange).compactMap { range in
+                AttributedString.Index(range.lowerBound, within: self).flatMap { start in
+                    AttributedString.Index(range.upperBound, within: self).map { start..<$0 }
+                }
             }
             guard !wordRanges.isEmpty else { return [sentenceRange] }
             wordRanges[0] = sentenceRange.lowerBound..<wordRanges[0].upperBound

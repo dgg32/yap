@@ -79,14 +79,26 @@ final class DebugTiming {
 
 // MARK: - DebugFilters
 
-/// With `YAP_DEBUG_FILTERS=1`, reports on stderr each Whisper line that was dropped and why, and each
-/// time Apple's transcriber supplied the text instead.
+/// With `YAP_DEBUG_FILTERS=1`, reports on stderr each final Whisper line that was dropped and why,
+/// each final decode that heard no words, and each time Apple's transcriber supplied the text
+/// instead. Tentative and discarded speculative decodes aren't reported: they never became lines.
 enum DebugFilters {
     static let isEnabled = ProcessInfo.processInfo.environment["YAP_DEBUG_FILTERS"] == "1"
 
     static func dropped(_ text: String, reason: String) {
+        report([dropNote(text, reason: reason)])
+    }
+
+    static func dropNote(_ text: String, reason: String) -> String {
+        "dropped (\(reason)): \(text)"
+    }
+
+    /// Prints notes collected during a decode, once the decode is used for a line.
+    static func report(_ notes: [String]) {
         guard isEnabled else { return }
-        FileHandle.standardError.write(Data("[filter] dropped (\(reason)): \(text)\n".utf8))
+        for note in notes {
+            FileHandle.standardError.write(Data("[filter] \(note)\n".utf8))
+        }
     }
 
     static func replaced(_ whisperText: String, with previewText: String) {

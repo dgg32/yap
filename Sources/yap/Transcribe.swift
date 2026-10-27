@@ -76,35 +76,17 @@ import Speech
             attributeOptions: outputFormat.needsAudioTimeRange ? [.audioTimeRange] : []
         )
         let modules: [any SpeechModule] = [transcriber]
-        let installedLocales = await SpeechTranscriber.installedLocales
-        if !installedLocales.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) {
-            if let request = try await AssetInventory.assetInstallationRequest(supporting: modules) {
-                try await noora.progressBarStep(
-                    message: "Downloading required assets…"
-                ) { @Sendable progressCallback in
-                    struct ReportProgress: @unchecked Sendable {
-                        let callAsFunction: (Double) -> Void
-                    }
-                    let reportProgress = ReportProgress(callAsFunction: progressCallback)
-                    try await withThrowingDiscardingTaskGroup { group in
-                        group.addTask {
-                            while !Task.isCancelled, !request.progress.isFinished {
-                                reportProgress.callAsFunction(request.progress.fractionCompleted)
-                                try await Task.sleep(for: .seconds(0.1))
-                            }
-                        }
-                        try await request.downloadAndInstall()
-                        group.cancelAll()
-                    }
-                }
-            }
-        }
+        try await installSpeechAssets(for: locale, modules: modules)
 
         let analyzer = SpeechAnalyzer(modules: modules)
 
         let preparedAudioFile = try await TranscriptionAudioFile.prepare(inputFile)
         defer { preparedAudioFile.removeTemporaryFile() }
         let audioFile = preparedAudioFile.audioFile
+        // The analyzer never finishes on a file without frames, so the results would be awaited forever
+        guard audioFile.length > 0 else {
+            throw TranscriptionError.noAudio(inputFile.path)
+        }
         let audioFileDuration: TimeInterval = Double(audioFile.length) / audioFile.processingFormat.sampleRate
         try await analyzer.start(inputAudioFile: audioFile, finishAfterFile: true)
 

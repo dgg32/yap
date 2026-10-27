@@ -123,7 +123,12 @@ extension Listen {
             print(header)
         }
 
+        /// What the last decode's own filtering removed. Reported only when the decode is used for a
+        /// line, so the filter log leaves out tentative and discarded speculative decodes.
+        var decodeNotes: [String] = []
+
         func transcribe(_ samples: [Float]) async throws -> [TranscriptionSegment] {
+            decodeNotes = []
             // Only the end of the previous line matters as context, and each prompt token costs decode time
             let prompt = vocabularyTokens + tokens(previousLine, limit: 16)
             options.promptTokens = prompt.isEmpty ? nil : prompt
@@ -131,7 +136,7 @@ extension Listen {
             let results = try await whisper.transcribe(audioArray: samples, decodeOptions: options)
             timing?.decodeEnded(temperatures: results.flatMap(\.segments).map(\.temperature))
             if results.flatMap(\.segments).isEmpty {
-                DebugFilters.dropped("", reason: String(format: "Whisper returned nothing for %.1f s of audio", Double(samples.count) / sampleRate))
+                decodeNotes.append(String(format: "Whisper heard no words in %.1f s of speech", Double(samples.count) / sampleRate))
             }
             return results
                 .flatMap(\.segments)
@@ -156,7 +161,7 @@ extension Listen {
                 }
                 .filter {
                     guard WhisperFilter.isLikelyHallucination($0) else { return true }
-                    DebugFilters.dropped($0.text, reason: "hallucination or filler")
+                    decodeNotes.append(DebugFilters.dropNote($0.text, reason: "hallucination or filler"))
                     return false
                 }
         }
@@ -193,7 +198,7 @@ extension Listen {
         let padding = Int(sampleRate * 0.2)
         var previewFlushed = false
         /// A transcription of the utterance ending at `speechEnd`, made before its pause was confirmed.
-        var speculative: (speechEnd: Int, length: Int, segments: [TranscriptionSegment])?
+        var speculative: (speechEnd: Int, length: Int, segments: [TranscriptionSegment], notes: [String])?
 
         while true {
             let (samples, offset, finished) = audio.snapshot()
@@ -250,10 +255,12 @@ extension Listen {
                 let segments: [TranscriptionSegment]
                 if let speculative, speculative.speechEnd == offset + pause.lowerBound, speculative.length == utterance.count {
                     segments = speculative.segments
+                    DebugFilters.report(speculative.notes)
                     timing?.speculationUsed()
                 } else {
                     if speculative != nil { timing?.speculationWasted() }
                     segments = try await transcribe(utterance)
+                    DebugFilters.report(decodeNotes)
                 }
                 speculative = nil
                 for segment in segments {
@@ -276,7 +283,8 @@ extension Listen {
                end - silence >= Int(sampleRate * 0.2), speculative?.speechEnd != silence {
                 if speculative != nil { timing?.speculationWasted() }
                 let utterance = Array(samples[..<min(samples.count, silence - offset + padding)])
-                speculative = (silence, utterance.count, try await transcribe(utterance))
+                let segments = try await transcribe(utterance)
+                speculative = (silence, utterance.count, segments, decodeNotes)
                 // Check again soon: the pause may be confirmed by now
                 lastDecodedEnd = end - Int(sampleRate * 0.2)
                 continue
@@ -291,7 +299,9 @@ extension Listen {
                 let split = activity.quietestPoint(
                     in: (offset + Int(sampleRate * 4))..<min(end - Int(sampleRate * 1), offset + Int(sampleRate * 25))
                 ) - offset
-                for segment in try await transcribe(Array(samples[..<split])) {
+                let segments = try await transcribe(Array(samples[..<split]))
+                DebugFilters.report(decodeNotes)
+                for segment in segments {
                     emitFinal(segment, offset: offset, length: split)
                 }
                 audio.drop(upTo: offset + split)
@@ -307,6 +317,8 @@ extension Listen {
             // otherwise earlier segments are settled once Whisper starts a new one.
             let settled = finished || duration >= 25
             let finalCount = settled ? segments.count : max(0, segments.count - 1)
+            // Until settled, this decode is re-done on the next pass
+            if settled { DebugFilters.report(decodeNotes) }
 
             for segment in segments.prefix(finalCount) {
                 emitFinal(segment, offset: offset, length: samples.count)
@@ -993,9 +1005,7 @@ enum WhisperFilter {
     /// Why `isUnreliable` is true for `segment`, or nil.
     static func unreliability(of segment: TranscriptionSegment, vocabulary: [String] = []) -> String? {
         let content = letters(segment.text)
-        if segment.noSpeechProb > 0.6, content.count <= 4 || segment.avgLogprob < -1 {
-            return String(format: "no speech (noSpeechProb %.2f, avgLogprob %.2f)", segment.noSpeechProb, segment.avgLogprob)
-        }
+        // No `noSpeechProb` test: WhisperKit leaves it at 0, and would set it for the whole decode, not the segment
         if segment.avgLogprob < -1.2 { return String(format: "low confidence (avgLogprob %.2f)", segment.avgLogprob) }
         if segment.compressionRatio > 2.4 { return String(format: "compression ratio %.2f", segment.compressionRatio) }
         if hasRepeatedPhrase(content) { return "repeated phrase" }

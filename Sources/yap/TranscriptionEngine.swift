@@ -52,6 +52,10 @@ enum TranscriptionEngine {
         let analyzer = SpeechAnalyzer(modules: modules)
         let preparedAudioFile = try await TranscriptionAudioFile.prepare(file)
         defer { preparedAudioFile.removeTemporaryFile() }
+        // The analyzer never finishes on a file without frames, so the results would be awaited forever
+        guard preparedAudioFile.audioFile.length > 0 else {
+            throw TranscriptionError.noAudio(file.path)
+        }
         try await analyzer.start(inputAudioFile: preparedAudioFile.audioFile, finishAfterFile: true)
 
         var transcript: AttributedString = ""
@@ -70,6 +74,7 @@ enum TranscriptionError: Error, LocalizedError {
     case speechTranscriberNotAvailable
     case unsupportedLocale(String)
     case audioConversionFailed
+    case noAudio(String)
 
     // MARK: Internal
 
@@ -83,6 +88,8 @@ enum TranscriptionError: Error, LocalizedError {
             "Locale \"\(identifier)\" is not supported for speech transcription."
         case .audioConversionFailed:
             "The audio file could not be prepared for transcription."
+        case let .noAudio(path):
+            "\(path) contains no audio."
         }
     }
 }

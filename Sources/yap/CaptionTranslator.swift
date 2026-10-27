@@ -42,11 +42,13 @@ final class CaptionTranslator {
         return language.minimalIdentifier
     }
 
-    /// The translation of `text`, or nil if it couldn't be translated. The first failure is reported
-    /// on stderr, so a translation that stops working isn't silent.
+    /// The translation of `text`, or nil if it couldn't be translated or came back empty (which would
+    /// add an empty line to a subtitle cue). The first failure is reported on stderr, so a translation
+    /// that stops working isn't silent.
     func translate(_ text: String) async -> String? {
         do {
-            return try await session.translate(text).targetText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let translation = try await session.translate(text).targetText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return translation.isEmpty ? nil : translation
         } catch {
             if !reportedFailure {
                 reportedFailure = true

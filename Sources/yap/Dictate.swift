@@ -36,19 +36,7 @@ struct Dictate: AsyncParsableCommand {
     ) var wordTimestamps: Bool = false
 
     @MainActor mutating func run() async throws {
-        guard SpeechTranscriber.isAvailable else {
-            throw Transcribe.Error.speechTranscriberNotAvailable
-        }
-
-        let supportedLocales = await SpeechTranscriber.supportedLocales
-        guard supportedLocales.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) else {
-            throw Transcribe.Error.unsupportedLocale
-        }
-
-        for locale in await AssetInventory.reservedLocales {
-            await AssetInventory.release(reservedLocale: locale)
-        }
-        try await AssetInventory.reserve(locale: locale)
+        try await reserveSpeechAssets(for: locale)
 
         let transcriber = SpeechTranscriber(
             locale: locale,
@@ -58,36 +46,7 @@ struct Dictate: AsyncParsableCommand {
         )
         let modules: [any SpeechModule] = [transcriber]
 
-        let installedLocales = await SpeechTranscriber.installedLocales
-        if !installedLocales.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) {
-            let piped = isatty(STDOUT_FILENO) == 0
-            struct DevNull: StandardPipelining { func write(content _: String) {} }
-            let noora = if piped {
-                Noora(standardPipelines: .init(output: DevNull()))
-            } else {
-                Noora()
-            }
-            if let request = try await AssetInventory.assetInstallationRequest(supporting: modules) {
-                try await noora.progressBarStep(
-                    message: "Downloading required assets…"
-                ) { @Sendable progressCallback in
-                    struct ReportProgress: @unchecked Sendable {
-                        let callAsFunction: (Double) -> Void
-                    }
-                    let reportProgress = ReportProgress(callAsFunction: progressCallback)
-                    try await withThrowingDiscardingTaskGroup { group in
-                        group.addTask {
-                            while !Task.isCancelled, !request.progress.isFinished {
-                                reportProgress.callAsFunction(request.progress.fractionCompleted)
-                                try await Task.sleep(for: .seconds(0.1))
-                            }
-                        }
-                        try await request.downloadAndInstall()
-                        group.cancelAll()
-                    }
-                }
-            }
-        }
+        try await installSpeechAssets(for: locale, modules: modules)
 
         let analyzer = SpeechAnalyzer(modules: modules)
 
