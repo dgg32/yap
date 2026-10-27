@@ -6,9 +6,12 @@ and the Whisper engine. The target workload is
 with background music.
 
 Four review rounds so far (2026-10-24 to 2026-10-26), plus a latency round measured on four
-clips of an NHK drama (8.8 minutes of dialogue, with reference subtitles). This file lists what is **still open**,
-then a one-line record of what was fixed, then what was checked and is *not* a bug. The full
-write-ups of fixed findings, with their measurements, are in git history (`git log -p BUG.md`).
+clips of an NHK drama (8.8 minutes of dialogue, with reference subtitles). A fifth round (2026-10-27)
+was a code read-through for errors, stray edits and logic errors rather than a feature review;
+round 6 fixed what it found, except C6, C8 and C9. This
+file lists what is **still open**, then a one-line record of what was fixed, then what was checked
+and is *not* a bug. The full write-ups of fixed findings, with their measurements, are in git
+history (`git log -p BUG.md`).
 
 Severity: **High** = visible quality or latency damage in a normal workflow · **Medium** = wrong
 under specific conditions · **Low** = minor, cosmetic or hygiene.
@@ -21,20 +24,70 @@ Nothing High is open.
 
 | ID | Severity | Area | One line |
 |---|---|---|---|
+| [C6](#c6) | Medium | Latency | `--no-preview` on a terminal still re-decodes the whole pending buffer every tick (+37 % CPU) |
 | [A3](#a3) | Medium | Quality · filters | A line said twice in a row is dropped as a Whisper loop |
 | [J4](#j4) | Medium | Quality · alignment | Volatile preview text is still cut by counting characters; kanji vs kana can shift the cut |
 | [S4](#s4) | Medium | Quality · filters | The filters can't be turned off, and the confidence thresholds are tuned for English |
+| [L9](#l9) | Medium | Quality | Reported: long lines occasionally go missing. Not reproduced yet |
 | [L2](#l2) | Low | Latency | Speech with no pause gets no final text for 10 s |
 | [A5](#a5) | Low | Quality · output | Text output and subtitle output read and translate different units (also R10) |
 | [A6](#a6) | Low | Quality · translation | A cue can end up with no translation when the translation is short |
 | [R7](#r7) | Low | Output | With `--reading` and `--translate`, an SRT cue has three lines; many players show two |
 | [R11](#r11) | Low | Memory | `--input` decodes the whole file into memory (≈96 MB for 25 minutes) |
 | [R12](#r12) | Low | Quality · VAD | With `--vad energy`, dialogue quieter than 2× the music bed isn't detected (old N1/N2) |
-| [L9](#l9) | Medium | Quality | Reported: long lines occasionally go missing. Not reproduced yet |
 | [R13](#r13) | Low | Output | Whisper's timestamps for a very short utterance are short: a 0.4 s 「はい」 becomes a 0.2 s cue |
 | [B4](#b4) | Low | Translation | The translation source language always comes from `--locale` |
 | [S1](#s1) | Low | Suggestion | Show which model was resolved; make the "No models found" error friendlier |
 | [S7](#s7) | Low | Testing | CI doesn't run the tests, and `ApplePreview.settle` has no tests |
+| [C8](#c8) | Low | Robustness | `MCP_Command` hard-codes the server version |
+| [C9](#c9) | Low | Output | A space is only inserted between two ASCII pieces of a line |
+
+<a id="c6"></a>
+### C6 — Medium: `--no-preview` on a terminal still re-decodes the whole pending buffer
+
+L1 was fixed by `oncePerUtterance = preview != nil || !live`, which covers the preview and every
+non-live output (SRT, VTT, JSON, piped text). The one case left is `--no-preview` on a terminal,
+where `preview == nil` and `live` is true — there, Whisper's own tentative text is the only live
+feedback, so the loop falls through to `transcribe(samples)` with the **whole** pending buffer on
+every pass.
+
+Measured on a 30 s clip through a pty:
+
+```
+with the preview : 10.5 s user
+--no-preview     : 14.4 s user   (+37 %)
+```
+
+Round 1's "8.7× amplification" was about audio-seconds re-decoded, not CPU; the CPU cost is
+dominated by the encoder on the GPU, so +37 % is the honest number. It still grows with the
+length of the pending utterance.
+
+Fix: cap what is re-decoded for the tentative text (decode only the newest window, or keep the
+last decode's text and refresh it on a timer), or make `--no-preview` fall back to the
+non-live schedule and update the terminal text less often.
+
+<a id="c8"></a>
+### C8 — Low: `MCP_Command` hard-codes the server version
+
+`MCP.swift` reports `version: "1.0.0"` to clients. The package has no version of its own
+(`Package.swift` names the executable `yap` and nothing else), so this number can drift from the
+tool's actual version without anything noticing.
+
+<a id="c9"></a>
+### C9 — Low: a space is only inserted between two ASCII pieces of a line
+
+`LiveLine.appendFinal` joins the pieces of a line:
+
+```swift
+if let last = open.last, let first = text.first, last.isASCII, first.isASCII,
+   last.isLetter || last.isNumber || last.isPunctuation, first.isLetter || first.isNumber {
+    open += " "
+}
+```
+
+The `isASCII` guard is right for Japanese (no space between 「。」 and the next word), but it also
+means a line ending in a non-ASCII punctuation mark gets no space before an English word:
+"…" + "Hello" becomes "…Hello".
 
 <a id="a3"></a>
 ### A3 — Medium: a line said twice in a row is dropped
@@ -186,6 +239,14 @@ make it testable.
 
 | ID | Round | Was | Fix |
 |---|---|---|---|
+| C1 | 6 | `yap transcribe` (and the MCP path) hung forever on a zero-length file: the analyzer never finishes without frames | Both check `audioFile.length > 0` first and report "*file* contains no audio". Verified: 0.55 s and an error instead of a hang. (Medium rather than High: an empty file isn't a normal workflow.) |
+| C2 | 6 | `listen-and-dictate` gave ScreenCaptureKit the global concurrent queue, so `AVAudioConverter` could be used from two threads | Uses the delegate's serial queue, as `listen` does. |
+| C3 | 6 | `listen-and-dictate` didn't feed silence during playback gaps, so a short last line could stay unfinalized | Calls `startSilencePadding()` like `listen`. |
+| C4 | 6 | The per-segment judgement still tested `noSpeechProb`, which WhisperKit sets per window | Moot in practice — WhisperKit never computes it (`let noSpeechProb: Float = 0 // TODO`, TextDecoder.swift:821), so the test could never fire. Removed, with a comment, so it doesn't start dropping whole windows if WhisperKit implements it. |
+| C5 | 6 | `YAP_DEBUG_FILTERS` also reported filtering from tentative and discarded speculative decodes, and empty decodes as "dropped" | Notes from a decode are held until the decode is used for a line, and discarded otherwise. An empty decode is reported as "Whisper heard no words in *n* s of speech". In practice the old log had 2 such entries over four clips, so earlier logs were nearly right. |
+| C7 | 6 | The Speech-asset installation was copied out in five places, not three | `dictate` and `listen-and-dictate` call `reserveSpeechAssets` / `installSpeechAssets`; `transcribe` calls `installSpeechAssets` (its own locale check stays, because it lists the supported locales). The MCP path keeps its copy on purpose: the shared helper draws a progress bar on stdout, which is the MCP protocol channel. |
+| C10 | 6 | Four force-unwrapped `AttributedString.Index` conversions in `sentences(maxLength:)` | `compactMap`, as in `wordTimestamps()`: an unconvertible range is skipped instead of crashing. |
+| C11 | 6 | An empty translation added an empty line to an SRT cue | `CaptionTranslator.translate` returns nil for an empty result. |
 | Latency | 5 | A final line appeared a median **1.6 s** after its speech ended: ~0.85 s waiting for the pause to be confirmed, then ~0.75 s of decoding | **Speculative decoding:** Whisper starts once the speaker has been quiet for 0.2 s, and the result is used when the pause is confirmed (128 of 130 lines). Median **1.6 s → 1.05 s**, with the same CER (8.2 % → 7.9 %, within run-to-run noise). About a quarter of speculative decodes are thrown away because the speaker went on. |
 | Latency | 5 | Temperature fallbacks (up to 3 extra decodes) made the slowest lines take 3–5 s | `temperatureFallbackCount: 1`. The same CER (7.9 %), and lines over 2 s went from 6 of 130 to 3 (one of them is L2's 10 s split). |
 | P1 | 5 | The translation was awaited in the caption loop | Translations are printed under their line when they arrive (text output) or written by an ordered queue (subtitles), so the captions don't wait. Only a line ending while the previous translation is still in flight waits for it, which keeps each translation under its own line. Measured with `--translate en`: translation added **40 ms** per line before and **17 ms** after. Round 2's "70–105 ms, doubles the latency" was far too high: it was measured cold, and drama lines are short. Verified in text, SRT and terminal output. |
@@ -281,6 +342,26 @@ Recorded so they aren't re-investigated.
   starts another 30 s window near the end of the audio. Utterances here are under 30 s, so the
   first window always covers the whole utterance; the only difference is that audio of 0.2–1 s
   is now decoded at all.
+* **Round 5, code read-through — no stray edits.** No `TODO`/`FIXME`, no leftover `print`/`dump`
+  debugging, no dead branches. The two debug helpers (`DebugTiming`, `DebugFilters`) are
+  deliberate and gated behind `YAP_DEBUG_TIMING=1` / `YAP_DEBUG_FILTERS=1`. `Tests/video/` (a
+  1.6 GB NHK episode and the CER clips) is gitignored, not committed.
+* **Round 5 — the per-segment `avgLogprob` is comparable to WhisperKit's own.** WhisperKit
+  averages the log-probabilities of the tokens from `<|startoftranscript|>` to `<|endoftext|>`
+  (`TextDecoder.swift`), which include the timestamp tokens; yap's per-segment average is over
+  the segment's own tokens, which include the same kind of tokens. So the `-1` / `-1.2`
+  thresholds mean the same thing before and after round 4 — they just apply to one segment
+  instead of the whole window.
+* **Round 5 — the compression ratio is the same measure as before.** yap recomputes it with
+  `TextUtilities.compressionRatio(of: [Int])`, which is exactly what WhisperKit uses for its own
+  final value (`TextDecoder.swift:813`); it compresses token IDs rather than text, in both
+  cases. The `2.4` threshold is comparable.
+* **Round 5 — the `AVAudioConverter` single-buffer pattern is the standard one.** Both
+  `ApplePreview.feed` and `AudioStreamDelegate` pass one input buffer and return `.noDataNow`
+  afterwards, which is the documented way to convert a buffer of unknown length.
+* **Round 5 — a partial Silero download is cleaned up.** `SileroModelStore.load` downloads into a
+  staging directory and only moves it into place once every file is there; an interrupted
+  download leaves the staging directory, which the next run removes.
 
 ---
 
@@ -309,3 +390,17 @@ Recorded so they aren't re-investigated.
 * Short-utterance checks (R1, R2, R13): make clips with
   `say -v Kyoko -o clip.wav --data-format=LEI16@16000 "はい"` and run
   `yap listen -l ja-JP --engine whisper --input clip.wav --srt`.
+
+* Round 5 checks:
+
+  ```bash
+  # C1 — a zero-length file (hung before round 6; now reports "contains no audio")
+  python3 -c "import wave; w=wave.open('/tmp/empty.wav','wb'); w.setnchannels(1); \
+      w.setsampwidth(2); w.setframerate(16000); w.writeframes(b''); w.close()"
+  yap transcribe -l ja-JP /tmp/empty.wav
+
+  # C6 — the cost of --no-preview on a terminal (needs a pty for `live`)
+  ffmpeg -v error -stream_loop 5 -i clip.wav -t 30 -c:a pcm_f32le long.wav -y
+  time script -q /dev/null yap listen -l ja-JP --engine whisper --input long.wav
+  time script -q /dev/null yap listen -l ja-JP --engine whisper --no-preview --input long.wav
+  ```
