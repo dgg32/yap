@@ -75,6 +75,7 @@ enum TranscriptionError: Error, LocalizedError {
     case unsupportedLocale(String)
     case audioConversionFailed
     case noAudio(String)
+    case unreadableAudio(String, String)
 
     // MARK: Internal
 
@@ -90,6 +91,8 @@ enum TranscriptionError: Error, LocalizedError {
             "The audio file could not be prepared for transcription."
         case let .noAudio(path):
             "\(path) contains no audio."
+        case let .unreadableAudio(path, reason):
+            "Could not read the audio of \(path): \(reason)"
         }
     }
 }

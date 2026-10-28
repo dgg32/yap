@@ -171,12 +171,18 @@ final class FileAudioSource: LiveAudioSource, @unchecked Sendable {
         converter.downmix = true
         var samples: [Float] = []
         nonisolated(unsafe) let source = input
+        nonisolated(unsafe) var readError: Error?
         var status: AVAudioConverterOutputStatus
         repeat {
             output.frameLength = 0
             var error: NSError?
             status = converter.convert(to: output, error: &error) { _, inputStatus in
-                guard (try? file.read(into: source)) != nil, source.frameLength > 0 else {
+                do {
+                    try file.read(into: source)
+                } catch {
+                    readError = error
+                }
+                guard readError == nil, source.frameLength > 0 else {
                     inputStatus.pointee = .endOfStream
                     return nil
                 }
@@ -188,6 +194,13 @@ final class FileAudioSource: LiveAudioSource, @unchecked Sendable {
                 samples.append(contentsOf: UnsafeBufferPointer(start: channel, count: Int(output.frameLength)))
             }
         } while status == .haveData
+        // Some recordings have packets AVFoundation can't decode. Stopping there would quietly cut the
+        // recording short, so fail instead and let ffmpeg read it.
+        if let readError { throw readError }
+        let expected = Double(file.length) * format.sampleRate / file.processingFormat.sampleRate
+        if Double(samples.count) < expected - format.sampleRate {
+            throw ListenError.unreadableInput(url.path, reason: "AVFoundation decoded only part of it.")
+        }
         return samples
     }
 
@@ -210,7 +223,7 @@ final class FileAudioSource: LiveAudioSource, @unchecked Sendable {
             throw ListenError.unreadableInput(
                 url.path,
                 reason: process.terminationStatus == 127
-                    ? "AVFoundation can't read it; install ffmpeg (brew install ffmpeg) to read MKV and other formats."
+                    ? "AVFoundation can't read all of it; install ffmpeg (brew install ffmpeg) to read MKV, other formats and recordings with damaged packets."
                     : message.trimmingCharacters(in: .whitespacesAndNewlines)
             )
         }
