@@ -239,6 +239,7 @@ make it testable.
 
 | ID | Round | Was | Fix |
 |---|---|---|---|
+| V1 | 8 | A vocabulary longer than 160 tokens kept its *last* 160 (`.suffix`), so the first terms of the file were dropped silently, and the cut could fall inside a term | Whole terms are kept from the top of the file up to 160 tokens, with a note on stderr naming how many were left out. The README gives the measured cost of the list instead of "a little time". |
 | R14 | 7 | A meeting recording (a 4-hour Teams mp4, AAC) has packets AVFoundation rejects, the first at 7:39. `yap transcribe` failed with `ExtAudioFileRead` error −50, and `listen --input` was worse: it treated the error as the end of the file and **silently stopped at 7:39**. ffmpeg decodes the same packets without complaint | `transcribe` reads the file through once first (≈2 s for 4 hours) and, if it doesn't decode completely, converts it to a temporary WAV with ffmpeg; without ffmpeg it tries AVFoundation's exporter and, since that uses the same decoder, says that ffmpeg is needed. This also covers the old MP3 repair. `listen --input` throws on a read error or a short decode, so its ffmpeg fallback takes over. Verified on the recording: `transcribe` on the mp4 gives output identical to transcribing ffmpeg's WAV (1 363 cues, 3:53 instead of 3:48); `listen --input` reads past 7:39 and the second bad spot at 1:06:33; normal WAV and MP3 files take the fast path as before. |
 | C1 | 6 | `yap transcribe` (and the MCP path) hung forever on a zero-length file: the analyzer never finishes without frames | Both check `audioFile.length > 0` first and report "*file* contains no audio". Verified: 0.55 s and an error instead of a hang. (Medium rather than High: an empty file isn't a normal workflow.) |
 | C2 | 6 | `listen-and-dictate` gave ScreenCaptureKit the global concurrent queue, so `AVAudioConverter` could be used from two threads | Uses the delegate's serial queue, as `listen` does. |
@@ -329,6 +330,28 @@ Recorded so they aren't re-investigated.
   じゅうにぐう, at 0.5 ms per line.
 * **AVFoundation doesn't truncate `--input` files.** 48 kHz and 44.1 kHz stereo both decode to
   the full length.
+* **Round 8 (2026-11-15), measured on the four drama clips** (cuts 06:23–08:41, 10:45–12:13,
+  16:05–18:04, 22:30–25:34; logs in `Tests/video/results-round8*`):
+
+  | config | CER | reading CER | median line delay | worst |
+  |---|---|---|---|---|
+  | default (turbo), 2 runs | 7.4 % | 5.9 % | 0.96–1.16 s | ≤ 2.3 s, one 6.6 s |
+  | `kotoba-whisper-v2.2`, 2 runs | 10.1 % | 8.6 % | 1.22–1.39 s | 7–8 s per clip |
+  | `--vocabulary seiya.txt` (62 tokens) | 8.3 % | 7.2 % | 1.74–1.86 s | ≤ 2.8 s, one 7.3 s |
+  | 160-token vocabulary | 10.3 % | 8.3 % | 2.31–2.62 s | up to 7.8 s |
+
+  * *kotoba-whisper-v2.2:* worse on every clip, mostly from deletions (it writes less of each
+    line), and slower despite its smaller decoder. Rejected as a default.
+  * *The vocabulary prompt is the largest latency cost left.* WhisperKit feeds prompt tokens through
+    the decoder one step at a time (`TextDecoder.swift`, the `isPrefill` loop), on every decode, and
+    the prompt's key/value cache can't be reused across utterances because it depends on the audio
+    through cross-attention. The drama's CER rises with an unrelated list, as expected; the
+    accuracy gain on matching content (anime) has not been measured against reference subtitles.
+  * *The deletions are not the filters.* About half the errors are deletions, mostly
+    interjections (ただね, うん, まあ, ハァ, なおさら). `YAP_DEBUG_FILTERS` shows the filters only
+    drop garbage (avgLogprob −3 to −19), and the Apple fallback recovers the lines Whisper returns
+    empty. Whisper leaves the interjections out of lines it otherwise transcribes.
+  * The `--topic` prototype (branch `topic-prompt`) rose to 8.1 % CER for 40 more prompt tokens.
 * **Latency round, measured and rejected** (four drama clips, CER against the broadcast subtitles):
   * *Text decoder on the GPU (old L6):* decode times are the same as on the Neural Engine
     (median 0.74–0.84 s either way). It stays on the Neural Engine.

@@ -192,6 +192,8 @@ def main():
                     with captions.open("w", encoding="utf-8") as file:
                         result = subprocess.run(command, stdout=file, stderr=subprocess.PIPE, text=True)
                     seconds = time.monotonic() - began
+                    # Debug logs (YAP_DEBUG_TIMING, YAP_DEBUG_FILTERS) go to stderr
+                    (out / f"{clip}.{name}.{run}.err").write_text(result.stderr, encoding="utf-8")
                     if result.returncode != 0:
                         sys.exit(f"yap failed:\n{result.stderr}")
                 elif not captions.exists():

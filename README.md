@@ -83,7 +83,7 @@ yap video.mp4 --json --word-timestamps -o transcript.json
 `yap listen` transcribes system audio in real time — anything playing on your computer.
 
 ```
-USAGE: yap listen [--locale <locale>] [--censor] [--txt] [--srt] [--vtt] [--json] [--max-length <max-length>] [--word-timestamps] [--fast] [--no-fast] [--vocabulary <vocabulary>] [--engine <engine>] [--whisper-model <whisper-model>] [--whisper-repo <whisper-repo>] [--vad <vad>] [--preview] [--no-preview] [--translate <translate>] [--reading] [--input <input>] [--input-speed <input-speed>]
+USAGE: yap listen [--locale <locale>] [--censor] [--txt] [--srt] [--vtt] [--json] [--max-length <max-length>] [--word-timestamps] [--fast] [--no-fast] [--vocabulary <vocabulary>] [--engine <engine>] [--whisper-model <whisper-model>] [--whisper-repo <whisper-repo>] [--vad <vad>] [--preview] [--no-preview] [--translate <translate>] [--translator <translator>] [--reading] [--input <input>] [--input-speed <input-speed>]
 
 OPTIONS:
   -l, --locale <locale>   (default: current)
@@ -119,6 +119,10 @@ OPTIONS:
                           (default: --preview)
   --translate <translate> With --engine whisper, translate each final line into
                           this language (e.g. en, zh-Hans, zh-Hant).
+  --translator <translator>
+                          With --translate, which translator to use: apple
+                          (on-device) or llm (a chat model through OpenCode).
+                          (values: apple, llm; default: apple)
   --reading               With --engine whisper, show the hiragana reading of
                           each final line that has kanji.
   --input <input>         Play an audio or video file through the live pipeline
@@ -183,7 +187,7 @@ A vocabulary file lists names and terms to expect, one per line. Blank lines and
 十二宮
 ```
 
-With `--engine whisper`, the list is passed to the model as a prompt, which steers it toward these spellings. This fixes most misheard character names and invented terms. A longer list adds a little time to each update, so keep it to the terms that actually come out wrong. [`seiya.txt`](seiya.txt) is an example.
+With `--engine whisper`, the list is passed to the model as a prompt, which steers it toward these spellings. This fixes most misheard character names and invented terms. The list costs time on every line, because Whisper reads each prompt token as an extra decoding step: measured on four drama clips, final lines appeared a median 1.05 s after speech ended without a list, 1.8 s with `seiya.txt` (62 tokens) and 2.4 s with a 160-token list. Keep it to the terms that actually come out wrong, most important first: only the first 160 tokens' worth of whole terms is used, and yap says so when terms are left out. [`seiya.txt`](seiya.txt) is an example.
 
 #### Translation
 
@@ -193,6 +197,21 @@ With `--engine whisper`, `--translate <language>` translates each finished line 
 - **Text output:** the original text is shown in cyan, and the translation is printed in the normal text color under each line, once the whole sentence is final. The dimmed in-progress text isn't translated.
 - **SRT/VTT:** the translation is a second line in each cue. **JSON:** a `translation` field.
 - **Quality:** good for everyday sentences, weaker on character names and nuanced lines.
+
+**LLM translation.** `--translator llm` sends each finished line to a chat model instead: GLM-5.3 Flash through [OpenCode Go](https://opencode.ai) by default, about 1 s per line. Each request includes the previous four lines and their translations, and the model is told that the text comes from speech recognition. It therefore keeps track of who is speaking and what is being discussed, and it can make sense of a sentence that Whisper split across cues (すみ / ません comes out as 不好意思, not 住 / 没有). The lines leave your Mac, so use it only for audio you're comfortable sending to OpenCode.
+
+- **Setup:** put your key from the [OpenCode console](https://opencode.ai/console) in a `.env` file in the directory you run yap from, or in `~/.config/yap/.env`. Shell variables override the file.
+
+  ```
+  OPENCODE_API_KEY=oc_sk_…
+  # Optional, with their defaults:
+  OPENCODE_MODEL=glm-5.3-flash
+  OPENCODE_BASE_URL=https://opencode.ai/inference/go/openai/v1   # Zen credits: https://opencode.ai/inference/openai/v1
+  OPENCODE_REASONING_EFFORT=low                                  # "default" leaves thinking to the model
+  ```
+
+- **Startup check:** a test request goes out at startup. If the key is missing or rejected, yap says why and captions without translating.
+- **Fallback:** if Apple's languages are installed too, a line that the LLM request fails on (network, timeout after 20 s) gets Apple's translation instead. yap reports the first failure on stderr.
 
 #### Readings
 
@@ -238,6 +257,9 @@ yap listen -l ja-JP --engine whisper --srt > captions.srt
 # Japanese captions with English translations, and bilingual subtitles
 yap listen -l ja-JP --engine whisper --translate en
 yap listen -l ja-JP --engine whisper --translate zh-Hans --srt > captions.srt
+
+# The same with an LLM translator (key in .env)
+yap listen -l ja-JP --engine whisper --translate zh-Hans --translator llm
 ```
 
 ### Listen and Dictate

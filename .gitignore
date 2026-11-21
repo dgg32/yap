@@ -8,3 +8,6 @@ DerivedData/
 .netrc
 /Tests/video/
 __pycache__/
+
+# Local secrets
+.env

@@ -73,9 +73,16 @@ struct Listen: AsyncParsableCommand {
     @Option(
         help: ArgumentHelp(
             "With --engine whisper, translate each final line into this language (e.g. en, zh-Hans, zh-Hant).",
-            discussion: "Uses Apple's on-device translation. Install the languages first in System Settings > General > Language & Region > Translation Languages."
+            discussion: "By default uses Apple's on-device translation (see --translator). Install the languages first in System Settings > General > Language & Region > Translation Languages."
         )
     ) var translate: String?
+
+    @Option(
+        help: ArgumentHelp(
+            "With --translate, which translator to use: apple (on-device) or llm (a chat model through OpenCode).",
+            discussion: "llm reads OPENCODE_API_KEY, and optionally OPENCODE_MODEL (default glm-5.3-flash), OPENCODE_BASE_URL and OPENCODE_REASONING_EFFORT, from the environment or a .env file in the current directory or ~/.config/yap/. Each line is sent with the previous few lines as context. Lines it fails on fall back to Apple's translation when its languages are installed."
+        )
+    ) var translator: TranslatorBackend = .apple
 
     @Flag(
         help: "With --engine whisper, show the hiragana reading of each final line that has kanji."
@@ -95,6 +102,9 @@ struct Listen: AsyncParsableCommand {
     func validate() throws {
         if translate != nil, engine != .whisper {
             throw ValidationError("--translate requires --engine whisper.")
+        }
+        if translator != .apple, translate == nil {
+            throw ValidationError("--translator requires --translate.")
         }
         if reading, engine != .whisper {
             throw ValidationError("--reading requires --engine whisper.")

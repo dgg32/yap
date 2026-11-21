@@ -46,7 +46,7 @@ extension Listen {
         let output = CaptionOutput(format: format, live: live, maxLength: maxLength)
         if let translate {
             do {
-                output.translator = try await CaptionTranslator.make(from: locale, to: translate)
+                output.translator = try await CaptionTranslator.make(from: locale, to: translate, backend: translator)
             } catch {
                 FileHandle.standardError.write(Data("\(error.localizedDescription) Continuing without translation.\n".utf8))
             }
@@ -116,7 +116,23 @@ extension Listen {
                     .suffix(limit)
             )
         }
-        let vocabularyTokens = tokens(vocabulary.joined(separator: "、"), limit: 160)
+        // Every prompt token is one more decoder step on every decode, so the list is capped. Whole
+        // terms are kept from the top of the file, so a long file loses its last terms, not its first.
+        var vocabularyTokens: [Int] = []
+        var keptTerms = 0
+        for count in stride(from: vocabulary.count, through: 1, by: -1) {
+            let candidate = tokens(vocabulary.prefix(count).joined(separator: "、"), limit: .max)
+            if candidate.count <= 160 {
+                vocabularyTokens = candidate
+                keptTerms = count
+                break
+            }
+        }
+        if keptTerms < vocabulary.count {
+            FileHandle.standardError.write(Data(
+                "--vocabulary: using the first \(keptTerms) of \(vocabulary.count) terms; the rest don't fit in Whisper's 160-token prompt.\n".utf8
+            ))
+        }
         var previousLine = ""
 
         if let header = format.header(locale: locale) {
