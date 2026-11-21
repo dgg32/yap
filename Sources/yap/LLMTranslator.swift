@@ -2,10 +2,10 @@ import Foundation
 
 // MARK: - LLMTranslator
 
-/// Translates caption lines with an OpenAI-compatible chat model (by default GLM-5.3 Flash through
-/// OpenCode Go). Each request carries the last few lines and their translations, so names, subjects
-/// and the speaker's tone carry over from line to line. The captions come from speech recognition,
-/// so the model is asked to translate what was most likely said.
+/// Translates caption lines, and with `corrects` also fixes misheard words in them, with an
+/// OpenAI-compatible chat model (by default GLM-5.3 Flash through OpenCode Go). Each request carries
+/// the last few lines, so names, subjects and the topic carry over from line to line. The captions
+/// come from speech recognition, so the model is asked to translate what was most likely said.
 @MainActor
 final class LLMTranslator {
     struct Config {
@@ -35,53 +35,122 @@ final class LLMTranslator {
         }
     }
 
+    struct Reply {
+        /// The corrected line; nil when not correcting or when the correction was rejected.
+        var corrected: String?
+        var translation: String?
+    }
+
     /// How many earlier lines go with each request as context.
     static let contextLines = 4
 
     let config: Config
+    let source: Locale
+    let target: String?
+    let corrects: Bool
+    private let translates: Bool
     private let systemPrompt: String
     /// OpenCode Go routes requests by session and refuses ones without it.
     private let sessionID = UUID().uuidString
     private let urlSession: URLSession
-    private var history: [(source: String, translation: String)] = []
+    /// Earlier lines (corrected, when correcting) and their translations.
+    private(set) var history: [(source: String, translation: String?)] = []
 
-    init(config: Config, source: Locale, target: String) {
+    init(config: Config, source: Locale, target: String?, corrects: Bool = false) {
         self.config = config
+        self.source = source
+        self.target = target
+        self.corrects = corrects
+        translates = target != nil
         let english = Locale(identifier: "en")
         let sourceName = english.localizedString(forIdentifier: source.language.minimalIdentifier) ?? source.identifier
-        let targetName = english.localizedString(forIdentifier: target) ?? target
-        systemPrompt = """
-        You translate live speech captions from \(sourceName) into \(targetName) (\(target)).
+        let targetName = target.map { "\(english.localizedString(forIdentifier: $0) ?? $0) (\($0))" } ?? ""
+        let asr = """
         The captions come from automatic speech recognition, so they may contain misheard words, wrong \
-        homophones or a sentence cut in two. Translate what the speaker most likely said, using the earlier \
-        lines for context (who is speaking, names, what "it" refers to).
-        Translate only the new line. Output the translation alone: no notes, quotes, readings or the original text.
+        homophones (the wrong kanji for the right sound) or a sentence cut in two.
         """
+        if corrects {
+            let correction = """
+            "corrected": the line with recognition errors fixed. Only change a word when it is very likely \
+            misheard: the fix must be read exactly the same (a homophone in different kanji), and fit the context clearly better. \
+            Check every word: one line can have several such errors, and a fix found in one place often \
+            applies to the same sound elsewhere in the line or the earlier lines. Keep everything else exactly as it is: wording, numbers, punctuation and kana/kanji spelling. \
+            If unsure, leave the word as it is.
+            """
+            if translates {
+                systemPrompt = """
+                You correct live speech captions in \(sourceName) and translate them into \(targetName).
+                \(asr)
+                Use the earlier lines for context (topic, who is speaking, names). For the new line, give:
+                1. \(correction)
+                2. "translation": the translation of the corrected line alone, with no notes or readings.
+                Reply with JSON only: {"corrected": "...", "translation": "..."}
+                """
+            } else {
+                systemPrompt = """
+                You correct live speech captions in \(sourceName).
+                \(asr)
+                Use the earlier lines for context (topic, who is speaking, names). For the new line, give
+                \(correction)
+                Reply with JSON only: {"corrected": "..."}
+                """
+            }
+        } else {
+            systemPrompt = """
+            You translate live speech captions from \(sourceName) into \(targetName).
+            \(asr) Translate what the speaker most likely said, using the earlier lines for context \
+            (who is speaking, names, what "it" refers to).
+            Translate only the new line. Output the translation alone: no notes, quotes, readings or the original text.
+            """
+        }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 20
         urlSession = URLSession(configuration: configuration)
     }
 
-    func translate(_ text: String) async throws -> String {
+    /// Corrects and/or translates `text`. The line goes into the context of the next requests even
+    /// when this one fails (as heard), so the context stays in step with the captions.
+    func process(_ text: String) async throws -> Reply {
+        let reply: Reply
+        do {
+            reply = try await request(text)
+        } catch {
+            remember(text, translation: nil)
+            throw error
+        }
+        remember(reply.corrected ?? text, translation: reply.translation)
+        return reply
+    }
+
+    private func remember(_ source: String, translation: String?) {
+        history.append((source, translation))
+        if history.count > Self.contextLines { history.removeFirst() }
+    }
+
+    private func request(_ text: String) async throws -> Reply {
         var user = ""
         if !history.isEmpty {
             user += "Earlier lines, for context only:\n"
             for line in history {
-                user += "\(line.source)\n→ \(line.translation)\n"
+                user += line.source + "\n"
+                if let translation = line.translation { user += "→ \(translation)\n" }
             }
             user += "\n"
         }
-        user += "New line to translate:\n\(text)"
+        user += corrects ? "New line:\n\(text)" : "New line to translate:\n\(text)"
 
         var body: [String: Any] = [
             "model": config.model,
             "stream": false,
-            "temperature": 0.3,
+            "temperature": corrects ? 0 : 0.3,
             "messages": [
                 ["role": "system", "content": systemPrompt],
                 ["role": "user", "content": user],
             ],
         ]
+        if corrects {
+            body["response_format"] = ["type": "json_object"]
+        }
         if config.reasoningEffort != "default" {
             body["reasoning_effort"] = config.reasoningEffort
         }
@@ -100,13 +169,49 @@ final class LLMTranslator {
             let detail = String(decoding: data.prefix(300), as: UTF8.self)
             throw CaptionTranslatorError.llmRequest("HTTP \(status) from \(config.model): \(detail)")
         }
-        let reply = try JSONDecoder().decode(ChatReply.self, from: data)
-        let translation = Self.clean(reply.choices.first?.message.content ?? "")
-        if !translation.isEmpty {
-            history.append((text, translation))
-            if history.count > Self.contextLines { history.removeFirst() }
+        let content = try JSONDecoder().decode(ChatReply.self, from: data).choices.first?.message.content ?? ""
+
+        var reply = Reply()
+        if corrects {
+            guard let fields = Self.jsonObject(in: content) else {
+                throw CaptionTranslatorError.llmRequest("\(config.model) didn't reply with JSON: \(content.prefix(200))")
+            }
+            if let corrected = fields["corrected"].map(Self.clean), !corrected.isEmpty, corrected != text {
+                if Self.soundsAlike(text, corrected) {
+                    reply.corrected = corrected
+                    DebugFilters.corrected(text, to: corrected)
+                } else {
+                    DebugFilters.correctionRejected(text, corrected)
+                }
+            }
+            reply.translation = fields["translation"].map(Self.clean).flatMap { $0.isEmpty ? nil : $0 }
+        } else {
+            let translation = Self.clean(content)
+            reply.translation = translation.isEmpty ? nil : translation
         }
-        return translation
+        return reply
+    }
+
+    /// The string fields of the JSON object in `reply`, which may be wrapped in a code fence or a
+    /// reasoning block.
+    nonisolated static func jsonObject(in reply: String) -> [String: String]? {
+        var text = reply
+        if let end = text.range(of: "</think>") { text = String(text[end.upperBound...]) }
+        guard let open = text.firstIndex(of: "{"), let close = text.lastIndex(of: "}"), open < close,
+              let object = try? JSONSerialization.jsonObject(with: Data(text[open...close].utf8)) as? [String: Any]
+        else { return nil }
+        return object.compactMapValues { $0 as? String }
+    }
+
+    /// Whether `corrected` reads the same as `heard`: a correction may swap the kanji of a misheard
+    /// word (構成 → 更生, both こうせい), but not change what was said. Even a one-sound difference is
+    /// refused, because that's how the model "fixes" a correct word into a plausible wrong one
+    /// (公正 → 公平). Compared as hiragana, ignoring punctuation and spaces.
+    nonisolated static func soundsAlike(_ heard: String, _ corrected: String) -> Bool {
+        func sounds(_ text: String) -> String {
+            String(JapaneseReading.hiragana(text).filter { $0.isLetter || $0.isNumber })
+        }
+        return sounds(heard) == sounds(corrected)
     }
 
     /// The reply without any reasoning block, surrounding whitespace or quotes the model added.
@@ -161,8 +266,10 @@ enum DotEnv {
             guard !line.hasPrefix("#"), let equals = line.firstIndex(of: "=") else { continue }
             let key = line[..<equals].trimmingCharacters(in: .whitespaces)
             var value = line[line.index(after: equals)...].trimmingCharacters(in: .whitespaces)
-            if value.count >= 2, let first = value.first, first == value.last, first == "\"" || first == "'" {
-                value = String(value.dropFirst().dropLast())
+            if let quote = value.first, quote == "\"" || quote == "'",
+               let close = value.dropFirst().firstIndex(of: quote) {
+                // A quoted value ends at its closing quote; anything after it (a comment) is dropped
+                value = String(value[value.index(after: value.startIndex)..<close])
             } else if let comment = value.range(of: " #") {
                 value = value[..<comment.lowerBound].trimmingCharacters(in: .whitespaces)
             }

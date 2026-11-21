@@ -85,6 +85,13 @@ struct Listen: AsyncParsableCommand {
     ) var translator: TranslatorBackend = .apple
 
     @Flag(
+        help: ArgumentHelp(
+            "With --engine whisper and Japanese, have the LLM fix misheard words in each final line (e.g. 構成 → 更生).",
+            discussion: "Uses the same OpenCode settings as --translator llm, and with --translate the same request translates the line too. Only corrections that read exactly the same as what Whisper heard (homophones in different kanji) are kept. In text output, a corrected line is printed in green under the original; in SRT, VTT and JSON it replaces it. YAP_DEBUG_FILTERS=1 logs every correction."
+        )
+    ) var correct: Bool = false
+
+    @Flag(
         help: "With --engine whisper, show the hiragana reading of each final line that has kanji."
     ) var reading: Bool = false
 
@@ -102,6 +109,13 @@ struct Listen: AsyncParsableCommand {
     func validate() throws {
         if translate != nil, engine != .whisper {
             throw ValidationError("--translate requires --engine whisper.")
+        }
+        if correct, engine != .whisper {
+            throw ValidationError("--correct requires --engine whisper.")
+        }
+        // The check that keeps corrections honest compares readings in hiragana, so it only works for Japanese
+        if correct, locale.language.languageCode != .japanese {
+            throw ValidationError("--correct only supports Japanese (-l ja-JP) for now.")
         }
         if translator != .apple, translate == nil {
             throw ValidationError("--translator requires --translate.")

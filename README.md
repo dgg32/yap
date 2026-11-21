@@ -46,6 +46,34 @@ To update, run `git pull` and `swift build -c release` again, then repeat the co
 
 > `brew install yap` and `mint install finnvoor/yap` install the original yap, without this fork's features. If you have one of them installed, uninstall it, or make sure `which yap` points to this build.
 
+### Live captions with LLM translation
+
+These commands caption whatever your Mac is playing in Japanese with Whisper, and translate each line into Simplified Chinese with GLM-5.3 Flash through [OpenCode](https://opencode.ai).
+
+1. Put your OpenCode API key in a `.env` file, either in the directory you run yap from or in `~/.config/yap/.env`:
+
+   ```
+   OPENCODE_API_KEY=oc_sk_…
+   ```
+
+2. Start captioning:
+
+   ```bash
+   # Live captions in the terminal
+   yap listen -l ja-JP --engine whisper --translate zh-Hans --translator llm
+
+   # Also save them as bilingual SRT subtitles
+   yap listen -l ja-JP --engine whisper --translate zh-Hans --translator llm --srt > captions.srt
+
+   # Also let the LLM fix misheard words (構成 → 更生), shown in green under the line
+   yap listen -l ja-JP --engine whisper --translate zh-Hans --translator llm --correct
+
+   # Try it on a recording instead of live audio
+   yap listen -l ja-JP --engine whisper --translate zh-Hans --translator llm --input episode.mkv
+   ```
+
+Use `--translate en` for English, or leave out `--translator llm` for Apple's on-device translation. `--correct` also works without `--translate`. The caption lines are sent to OpenCode. For the other settings, the fallback to Apple, and the Whisper setup, see [Translation](#translation), [Correcting misheard words](#correcting-misheard-words) and [Setting up Whisper](#setting-up-whisper).
+
 ### Examples
 
 #### Transcribe a YouTube video using yap and [yt-dlp](https://github.com/yt-dlp/yt-dlp)
@@ -83,7 +111,7 @@ yap video.mp4 --json --word-timestamps -o transcript.json
 `yap listen` transcribes system audio in real time — anything playing on your computer.
 
 ```
-USAGE: yap listen [--locale <locale>] [--censor] [--txt] [--srt] [--vtt] [--json] [--max-length <max-length>] [--word-timestamps] [--fast] [--no-fast] [--vocabulary <vocabulary>] [--engine <engine>] [--whisper-model <whisper-model>] [--whisper-repo <whisper-repo>] [--vad <vad>] [--preview] [--no-preview] [--translate <translate>] [--translator <translator>] [--reading] [--input <input>] [--input-speed <input-speed>]
+USAGE: yap listen [--locale <locale>] [--censor] [--txt] [--srt] [--vtt] [--json] [--max-length <max-length>] [--word-timestamps] [--fast] [--no-fast] [--vocabulary <vocabulary>] [--engine <engine>] [--whisper-model <whisper-model>] [--whisper-repo <whisper-repo>] [--vad <vad>] [--preview] [--no-preview] [--translate <translate>] [--translator <translator>] [--correct] [--reading] [--input <input>] [--input-speed <input-speed>]
 
 OPTIONS:
   -l, --locale <locale>   (default: current)
@@ -123,6 +151,8 @@ OPTIONS:
                           With --translate, which translator to use: apple
                           (on-device) or llm (a chat model through OpenCode).
                           (values: apple, llm; default: apple)
+  --correct               With --engine whisper, have the LLM fix misheard words
+                          in each final line (e.g. 構成 → 更生).
   --reading               With --engine whisper, show the hiragana reading of
                           each final line that has kanji.
   --input <input>         Play an audio or video file through the live pipeline
@@ -213,6 +243,15 @@ With `--engine whisper`, `--translate <language>` translates each finished line 
 - **Startup check:** a test request goes out at startup. If the key is missing or rejected, yap says why and captions without translating.
 - **Fallback:** if Apple's languages are installed too, a line that the LLM request fails on (network, timeout after 20 s) gets Apple's translation instead. yap reports the first failure on stderr.
 
+#### Correcting misheard words
+
+Whisper often writes the right sound in the wrong kanji: 構成 for 更生, 公地所 for 拘置所, 借り立てた for 駆り立てた. With `--correct`, the LLM (set up as for `--translator llm` above) gets each final line with the four before it and fixes such words from context. With `--translate`, the same request also translates the corrected line, so it adds no extra wait.
+
+- **Only homophones:** a correction is kept only if it reads exactly the same in hiragana as what Whisper heard. Without that check, the model sometimes "fixed" a correct word into a plausible wrong one that differs by one sound (公正 → 公平). As a result, words Whisper heard as a different sound, or a line split across cues (すみ / ません), stay as they are.
+- **Text output:** the line is printed as heard, and the corrected line appears in green under it with ✎, followed by the reading and the translation. **SRT, VTT, JSON:** the corrected text replaces the heard text.
+- **Context only looks back:** the model sees earlier lines, not later ones, so an error in the first line of a topic often stays (公正主義, before anything says the topic is rehabilitation). A `--vocabulary` file fixes such terms in Whisper itself.
+- **Reviewing:** `YAP_DEBUG_FILTERS=1` logs every correction kept and every one refused, with the line before and after.
+
 #### Readings
 
 With `--engine whisper`, `--reading` shows each final line again in hiragana, for example 「経緯をご説明して」 as 「けいいをごせつめいして」. The reading comes from macOS's own Japanese dictionary, with no download. Only lines with kanji get one.
@@ -260,6 +299,9 @@ yap listen -l ja-JP --engine whisper --translate zh-Hans --srt > captions.srt
 
 # The same with an LLM translator (key in .env)
 yap listen -l ja-JP --engine whisper --translate zh-Hans --translator llm
+
+# Fix misheard words with the LLM, without translating
+yap listen -l ja-JP --engine whisper --correct --srt > captions.srt
 ```
 
 ### Listen and Dictate

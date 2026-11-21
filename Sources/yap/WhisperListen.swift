@@ -8,6 +8,12 @@ import Speech
 // MARK: - Whisper engine for Listen
 
 extension Listen {
+    /// Reports that the translator couldn't be set up, naming what goes missing.
+    func reportTranslatorFailure(_ error: Error) {
+        let without = [translate != nil ? "translation" : nil, correct ? "correction" : nil].compactMap(\.self).joined(separator: " or ")
+        FileHandle.standardError.write(Data("\(error.localizedDescription) Continuing without \(without).\n".utf8))
+    }
+
     /// Live system-audio transcription with WhisperKit.
     ///
     /// Audio is collected into a pending utterance, which Whisper transcribes once speech pauses (or,
@@ -44,11 +50,18 @@ extension Listen {
         let timing = DebugTiming.isEnabled ? DebugTiming(sampleRate: sampleRate, speed: input == nil ? 1 : inputSpeed) : nil
 
         let output = CaptionOutput(format: format, live: live, maxLength: maxLength)
-        if let translate {
-            do {
-                output.translator = try await CaptionTranslator.make(from: locale, to: translate, backend: translator)
-            } catch {
-                FileHandle.standardError.write(Data("\(error.localizedDescription) Continuing without translation.\n".utf8))
+        // Set up the translator while the Whisper model loads, rather than before it: done first, it
+        // delayed the first line by 1–3 s. The LLM's test request doesn't hold anything up at all.
+        var translatorSetup: Task<CaptionTranslator?, Never>?
+        if translate != nil || correct {
+            let (locale, translate, translator, correct) = (locale, translate, translator, correct)
+            translatorSetup = Task {
+                do {
+                    return try await CaptionTranslator.make(from: locale, to: translate, backend: translator, corrects: correct)
+                } catch {
+                    reportTranslatorFailure(error)
+                    return nil
+                }
             }
         }
 
@@ -88,6 +101,17 @@ extension Listen {
         }
 
         nonisolated(unsafe) let whisper = try await WhisperModelStore.load(model: whisperModel, repo: whisperRepo)
+        if let translatorSetup, let made = await translatorSetup.value {
+            output.translator = made
+            Task {
+                do {
+                    try await made.verify()
+                } catch {
+                    reportTranslatorFailure(error)
+                    if output.translator === made { output.translator = nil }
+                }
+            }
+        }
         var options = DecodingOptions(
             task: .transcribe,
             language: locale.language.languageCode?.identifier,
@@ -392,10 +416,16 @@ final class CaptionOutput {
     private var committedTime = 0.0
     /// Whisper's final lines for the audio since the last commit.
     private var pending: [(text: String, start: Double, end: Double)] = []
-    /// Prints the translation of the last ended text line under it once it arrives. Translating takes
-    /// ~25 ms + 2 ms per character, so the captions carry on meanwhile; only the next line's end waits
-    /// for it, so that each translation lands under its own line.
+    /// Prints the notes (correction, reading, translation) of the last ended text line under it once
+    /// they arrive. Each line's notes are chained after the previous line's, so they print in order and
+    /// the LLM gets its requests one at a time. The captions carry on meanwhile; a line ending waits
+    /// at most `noteWait` per commit for the previous line's notes, so they usually land under their own line.
     private var note: Task<Void, Never>?
+    /// Apple's translation takes ~25 ms + 2 ms per character and an LLM about a second, so this
+    /// rarely runs out; a slow model (20 s and more) would otherwise stall the captions.
+    private let noteWait: Duration = .seconds(1)
+    /// Text lines ended so far, to tell when a line's notes arrive after a later line has ended.
+    private var endedLines = 0
     /// Writes subtitle cues in order, each once its translation is ready, without holding up the captions.
     private var writing: Task<Void, Never>?
 
@@ -429,11 +459,13 @@ final class CaptionOutput {
         }
         pending = []
         committedTime = commitEnd
+        // One deadline for the whole commit, which can end several lines
+        let noteDeadline = ContinuousClock.now + noteWait
         for (index, line) in lines.enumerated() {
-            await write(line.text, start: line.start, end: line.end, endsLine: endsLine && index == lines.count - 1)
+            await write(line.text, start: line.start, end: line.end, endsLine: endsLine && index == lines.count - 1, noteDeadline: noteDeadline)
         }
         if endsLine, lines.isEmpty, line.openWidth > 0 {
-            await note?.value
+            await waitForNote(until: noteDeadline)
             if let ended = line.endLine() { printNotes(for: ended) }
         }
         render()
@@ -446,15 +478,55 @@ final class CaptionOutput {
     }
 
     /// Prints the reading (yellow) of a line that just ended, and its translation (default color) once
-    /// it arrives. Await `note` before ending another line.
+    /// it arrives, after the previous line's notes. Call `waitForNote()` before ending another line.
+    ///
+    /// With --correct, the reading waits for the correction too, so it's the reading of the corrected
+    /// line, and a corrected line is printed (green) above it. Notes that arrive after a later line
+    /// has ended are headed by the start of their own line (dimmed), so they aren't read as the later
+    /// line's.
     private func printNotes(for text: String) {
-        if let reading = reading(of: text) {
-            line.printNote(reading, color: 33)
-        }
-        guard let translator else { return }
+        endedLines += 1
+        let index = endedLines
+        let translator = translator
+        guard translator != nil || reading(of: text) != nil else { return }
+        let previous = note
         note = Task {
-            guard let translation = await translator.translate(text), !translation.isEmpty else { return }
-            line.printNote(translation)
+            await previous?.value
+            var headed = false
+            @MainActor func printNote(_ note: String, color: Int? = nil) {
+                if !headed, endedLines > index {
+                    let head = text.count > 16 ? "\(text.prefix(16))…" : text
+                    line.printNote("↑ \(head)", color: 2)
+                }
+                headed = true
+                line.printNote(note, color: color)
+            }
+            let corrects = translator?.corrects ?? false
+            if !corrects, let reading = reading(of: text) {
+                printNote(reading, color: 33)
+            }
+            guard let translator else { return }
+            let result = await translator.process(text)
+            if result.text != text {
+                printNote("✎ \(result.text)", color: 32)
+            }
+            if corrects, let reading = reading(of: result.text) {
+                printNote(reading, color: 33)
+            }
+            if let translation = result.translation, !translation.isEmpty {
+                printNote(translation)
+            }
+        }
+    }
+
+    /// Waits until the last ended line's notes are printed, but no later than `deadline`.
+    private func waitForNote(until deadline: ContinuousClock.Instant) async {
+        guard let note, deadline > .now else { return }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await note.value }
+            group.addTask { try? await Task.sleep(until: deadline, clock: .continuous) }
+            await group.next()
+            group.cancelAll()
         }
     }
 
@@ -482,12 +554,12 @@ final class CaptionOutput {
         }
     }
 
-    private func write(_ text: String, start: Double, end: Double, endsLine: Bool) async {
+    private func write(_ text: String, start: Double, end: Double, endsLine: Bool, noteDeadline: ContinuousClock.Instant) async {
         if format == .txt {
             let endsSentence = text.last.map { "。！？!?…".contains($0) } ?? false
             // 80 columns, not characters: a Japanese character takes two
             let endsLine = endsLine || endsSentence || line.openWidth + displayWidth(of: text) > 80
-            if endsLine { await note?.value }
+            if endsLine { await waitForNote(until: noteDeadline) }
             if let ended = line.appendFinal(text, endsLine: endsLine) {
                 printNotes(for: ended)
             }
@@ -500,11 +572,18 @@ final class CaptionOutput {
         }
     }
 
-    private func writeCues(_ text: String, start: Double, end: Double) async {
+    private func writeCues(_ heard: String, start: Double, end: Double) async {
+        // Correct and translate the whole line, then split it into cues and share the translation out over them
+        var text = heard
+        var translation: String?
+        if let translator {
+            let result = await translator.process(heard)
+            text = result.text
+            translation = result.translation
+        }
         let cues = splitCaption(text, start: start, end: end, maxLength: maxLength)
-        // Translate the whole line, then share the translation out over its cues
         var translations: [String?] = Array(repeating: nil, count: cues.count)
-        if let translator, let translation = await translator.translate(text) {
+        if let translation {
             translations = splitEvenly(translation, into: cues.count)
         }
         for (cue, translation) in zip(cues, translations) {

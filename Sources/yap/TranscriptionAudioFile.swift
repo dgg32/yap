@@ -8,16 +8,23 @@ import AVFoundation
 /// packet than they can decode, and some meeting recordings have AAC packets it rejects partway
 /// through. `SpeechAnalyzer` then fails with an error from `ExtAudioFileRead`. So the file is read
 /// through once first (about 2 seconds for 4 hours of audio), and a file that doesn't decode
-/// completely is converted to a temporary file: with ffmpeg if it's installed, whose decoder is
-/// more tolerant, otherwise with AVFoundation's exporter.
+/// completely, or that it can't open at all (MKV), is converted to a temporary file: with ffmpeg if
+/// it's installed, whose decoder is more tolerant, otherwise with AVFoundation's exporter.
 struct TranscriptionAudioFile {
     let audioFile: AVAudioFile
 
     private let temporaryURL: URL?
 
     static func prepare(_ url: URL) async throws -> Self {
-        let audioFile = try AVAudioFile(forReading: url)
-        guard try !decodesCompletely(url, expectedLength: audioFile.length) else {
+        // A file AVFoundation can't open at all (MKV, WebM) goes the same way as one it can't decode
+        let opened: AVAudioFile?
+        do {
+            opened = try AVAudioFile(forReading: url)
+        } catch {
+            guard FileManager.default.isReadableFile(atPath: url.path) else { throw error }
+            opened = nil
+        }
+        if let audioFile = opened, try decodesCompletely(url, expectedLength: audioFile.length) {
             return Self(audioFile: audioFile, temporaryURL: nil)
         }
 
@@ -78,13 +85,14 @@ struct TranscriptionAudioFile {
         return decoded >= expectedLength
     }
 
-    /// Converts the file's audio to a mono WAV with ffmpeg. Returns nil if ffmpeg isn't installed.
+    /// Converts the file's audio to a 16 kHz mono WAV with ffmpeg (a quarter of the size of 48 kHz, and
+    /// the rate speech recognition works at anyway). Returns nil if ffmpeg isn't installed.
     private static func convertWithFFmpeg(_ url: URL, to output: URL) throws -> URL? {
         let process = Process()
         process.executableURL = URL(filePath: "/usr/bin/env")
         process.arguments = [
             "ffmpeg", "-nostdin", "-loglevel", "error", "-i", url.path,
-            "-vn", "-ac", "1", "-c:a", "pcm_s16le", "-y", output.path,
+            "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-y", output.path,
         ]
         let errors = Pipe()
         process.standardOutput = FileHandle.nullDevice

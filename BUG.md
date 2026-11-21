@@ -8,7 +8,9 @@ with background music.
 Four review rounds so far (2026-10-24 to 2026-10-26), plus a latency round measured on four
 clips of an NHK drama (8.8 minutes of dialogue, with reference subtitles). A fifth round (2026-10-27)
 was a code read-through for errors, stray edits and logic errors rather than a feature review;
-round 6 fixed what it found, except C6, C8 and C9. This
+round 6 fixed what it found, except C6, C8 and C9. Round 9 (2026-11-21) reviewed the LLM
+translator and the `--correct` feature; round 10 (the same day) fixed E1, E3, E4, E5 and E8 and
+measured E2. This
 file lists what is **still open**, then a one-line record of what was fixed, then what was checked
 and is *not* a bug. The full write-ups of fixed findings, with their measurements, are in git
 history (`git log -p BUG.md`).
@@ -24,6 +26,8 @@ Nothing High is open.
 
 | ID | Severity | Area | One line |
 |---|---|---|---|
+| [E6](#e6) | Medium | Testing | The read-aloud fixture can't be reproduced: it needs a prototype flag that no longer exists |
+| [E7](#e7) | Low | Hygiene | `topic.log`, the output of an abandoned prototype, is committed at the repository root |
 | [C6](#c6) | Medium | Latency | `--no-preview` on a terminal still re-decodes the whole pending buffer every tick (+37 % CPU) |
 | [A3](#a3) | Medium | Quality · filters | A line said twice in a row is dropped as a Whisper loop |
 | [J4](#j4) | Medium | Quality · alignment | Volatile preview text is still cut by counting characters; kanji vs kana can shift the cut |
@@ -41,6 +45,31 @@ Nothing High is open.
 | [S7](#s7) | Low | Testing | CI doesn't run the tests, and `ApplePreview.settle` has no tests |
 | [C8](#c8) | Low | Robustness | `MCP_Command` hard-codes the server version |
 | [C9](#c9) | Low | Output | A space is only inserted between two ASCII pieces of a line |
+
+<a id="e6"></a>
+### E6 — Medium: the read-aloud fixture can't be reproduced
+
+`Tests/readings.txt` is a good fixture — passages read by a speech synthesizer next to what yap
+heard, scored by `scripts/reading_cer.py`. But the runs in it were made with a prototype that no
+longer exists:
+
+```
+--- YAP_DEBUG_TOPIC=1 .build/release/yap listen -l ja-JP --engine whisper --translate zh-Hans
+```
+
+`YAP_DEBUG_TOPIC` is gone from the source (only `YAP_DEBUG_TIMING` and `YAP_DEBUG_FILTERS` are
+left), and the header says so: *"Not a baseline without --topic."* The data can still be scored,
+but it can't be re-measured, and it doesn't measure the current code.
+
+Fix: re-run the passages with the current `yap` and replace the sections, so the fixture is a
+baseline again.
+
+<a id="e7"></a>
+### E7 — Low: `topic.log` is a stray artifact at the repository root
+
+`topic.log` is the output of the abandoned `--topic` prototype (24 lines of guesses about the
+topic of the drama). It's committed at the repository root, where it looks like part of the
+project. Delete it, or move it next to the fixture it came from.
 
 <a id="c6"></a>
 ### C6 — Medium: `--no-preview` on a terminal still re-decodes the whole pending buffer
@@ -228,7 +257,7 @@ the shortcuts instead.
 <a id="s7"></a>
 ### S7 — Low: tests in CI
 
-`Tests/yapTests/` has 29 tests in 6 suites, all passing. But `.github/workflows/Release.yml`
+`Tests/yapTests/` has 38 tests in 7 suites, all passing. But `.github/workflows/Release.yml`
 only builds on tags and doesn't run them. `ApplePreview.settle`, where J4 lives, has no tests
 because it needs a live `SpeechAnalyzer`. Extracting its cut logic into a pure function would
 make it testable.
@@ -239,6 +268,11 @@ make it testable.
 
 | ID | Round | Was | Fix |
 |---|---|---|---|
+| E1 | 10 | With `--translator llm` or `--correct`, a text line ending waited for the previous line's LLM reply, with no limit, so a slow model (20–60 s for `deepseek-v4.1-flash`) would stall the captions | A commit waits at most 1 s in total for the previous line's notes. Notes are chained, so they still print in order and the LLM still gets one request at a time. A note that arrives after a later line has ended is headed by the start of its own line, dimmed (`↑ 報告書は…`). The translator is also set up while the Whisper model loads, and the LLM's test request runs in the background instead of before it. Measured on clip2 in real time (text output, `--correct --translate zh-Hans --translator llm`): median 0.99–1.03 s, against 0.94 s without the LLM, with lines after the first ≤ 1.2 s on the latest runs. The report's "about a second per line" didn't hold even before the fix (median +0.06 s): only lines ending in quick succession waited. |
+| E3 | 10 | `.env`: a quoted value followed by a comment kept its quotes (`"oc_sk_…" # my key`), so the key would get a 401 | A quoted value ends at its closing quote and the rest is dropped. A `#` inside the quotes stays. Tested. |
+| E4 | 10 | `--correct` silently refused every correction outside Japanese, because the check compares hiragana readings | `--correct` with a non-Japanese `--locale` is a validation error that says it supports Japanese only. Tested. |
+| E5 | 10 | `transcribe`'s ffmpeg fallback wrote the temporary WAV at the source rate | `-ar 16000`, as `listen --input` does. Found along the way: a file AVFoundation can't *open* (MKV) failed outright instead of reaching the fallback. It now goes to ffmpeg like a file that doesn't decode completely. Verified on a 25 s MKV cut from the drama. |
+| E8 | 10 | A failed LLM request left its line out of the next requests' context | The line goes into the context as heard. Tested against an unreachable server. |
 | V1 | 8 | A vocabulary longer than 160 tokens kept its *last* 160 (`.suffix`), so the first terms of the file were dropped silently, and the cut could fall inside a term | Whole terms are kept from the top of the file up to 160 tokens, with a note on stderr naming how many were left out. The README gives the measured cost of the list instead of "a little time". |
 | R14 | 7 | A meeting recording (a 4-hour Teams mp4, AAC) has packets AVFoundation rejects, the first at 7:39. `yap transcribe` failed with `ExtAudioFileRead` error −50, and `listen --input` was worse: it treated the error as the end of the file and **silently stopped at 7:39**. ffmpeg decodes the same packets without complaint | `transcribe` reads the file through once first (≈2 s for 4 hours) and, if it doesn't decode completely, converts it to a temporary WAV with ffmpeg; without ffmpeg it tries AVFoundation's exporter and, since that uses the same decoder, says that ffmpeg is needed. This also covers the old MP3 repair. `listen --input` throws on a read error or a short decode, so its ffmpeg fallback takes over. Verified on the recording: `transcribe` on the mp4 gives output identical to transcribing ffmpeg's WAV (1 363 cues, 3:53 instead of 3:48); `listen --input` reads past 7:39 and the second bad spot at 1:06:33; normal WAV and MP3 files take the fast path as before. |
 | C1 | 6 | `yap transcribe` (and the MCP path) hung forever on a zero-length file: the analyzer never finishes without frames | Both check `audioFile.length > 0` first and report "*file* contains no audio". Verified: 0.55 s and an error instead of a hang. (Medium rather than High: an empty file isn't a normal workflow.) |
@@ -386,6 +420,30 @@ Recorded so they aren't re-investigated.
 * **Round 5 — a partial Silero download is cleaned up.** `SileroModelStore.load` downloads into a
   staging directory and only moves it into place once every file is there; an interrupted
   download leaves the staging directory, which the next run removes.
+* **Round 9 — the LLM translator doesn't lose the captions.** The Apple fallback is set up
+  alongside the LLM, so a line whose request fails is still translated (and still corrected if
+  the request only failed for the translation), and the first failure is reported on stderr
+  rather than swallowed.
+* **Round 9/10 — only one LLM request is in flight at a time.** Each line's notes are chained
+  after the previous line's, so requests never overlap and the notes can't print out of order.
+  Since round 10 (E1), the captions don't wait for them beyond 1 s per commit.
+* **Round 10 — the prompt size (old E2) isn't worth shrinking.** OpenCode doesn't cache the prompt
+  (`cached_tokens: 0` on repeat requests in one session), so the ~250-token instructions are paid
+  for on every line. But that is about $0.00004 per line at list price, roughly 5 cents per hour of
+  dialogue, and billed against the OpenCode Go allowance. Shortening the instructions risks the
+  correction behaviour, which was tuned on them.
+* **Round 10 — a slow first line after a rebuild is macOS, not yap.** The first run of a freshly
+  built binary gave the first line 2.5–4.6 s, with or without the LLM (2.48 s without, then 1.13 s
+  on the next run of the same binary). Measure latency on a second run.
+* **Round 9 — the `--correct` guard keeps its promise.** `soundsAlike` compares the whole line as
+  hiragana, so a correction that changes a sound — or the length of the line — is refused, and
+  `YAP_DEBUG_FILTERS=1` logs every one that is kept and every one that is refused.
+* **Round 9 — the `.env` file is not committed.** `.gitignore` covers `.env` and the file in the
+  working tree is untracked, so the API key can't leak through a `git add -A`.
+* **Round 9 — `caption_cer.py`'s alignment is the same measure as before.** `Levenshtein.opcodes`
+  from rapidfuzz gives the same edit count as the old hand-written DP (checked on 5 000 random
+  pairs); only the split of equally short alignments into substitutions, deletions and
+  insertions can differ.
 
 ---
 
@@ -427,4 +485,17 @@ Recorded so they aren't re-investigated.
   ffmpeg -v error -stream_loop 5 -i clip.wav -t 30 -c:a pcm_f32le long.wav -y
   time script -q /dev/null yap listen -l ja-JP --engine whisper --input long.wav
   time script -q /dev/null yap listen -l ja-JP --engine whisper --no-preview --input long.wav
+  ```
+
+* Round 9 checks:
+
+  ```bash
+  # E1 — line latency with the LLM (run twice; the first run after a build is slow, see above)
+  YAP_DEBUG_TIMING=1 yap listen -l ja-JP --engine whisper --correct --translate zh-Hans \
+      --translator llm --input clip2.wav > /dev/null
+
+  # E3, E4, E8 — LLMTranslatorTests (swift test)
+
+  # E5 — transcribe a file AVFoundation can't open, through ffmpeg
+  ffmpeg -ss 645 -t 25 -i episode.mkv -c copy short.mkv && yap transcribe -l ja-JP short.mkv
   ```

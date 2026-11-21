@@ -106,4 +106,16 @@ enum DebugFilters {
         let whisper = whisperText.isEmpty ? "nothing" : "「\(whisperText)」"
         FileHandle.standardError.write(Data("[filter] Apple's text used, Whisper had \(whisper): \(previewText)\n".utf8))
     }
+
+    /// A line the LLM corrected (--correct).
+    static func corrected(_ heard: String, to corrected: String) {
+        guard isEnabled else { return }
+        FileHandle.standardError.write(Data("[filter] corrected: 「\(heard)」 → 「\(corrected)」\n".utf8))
+    }
+
+    /// A correction thrown away because it doesn't sound like what was heard.
+    static func correctionRejected(_ heard: String, _ corrected: String) {
+        guard isEnabled else { return }
+        FileHandle.standardError.write(Data("[filter] correction rejected (sounds different): 「\(heard)」 → 「\(corrected)」\n".utf8))
+    }
 }
