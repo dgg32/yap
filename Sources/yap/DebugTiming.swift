@@ -108,9 +108,10 @@ enum DebugFilters {
     }
 
     /// A line the LLM corrected (--correct).
-    static func corrected(_ heard: String, to corrected: String) {
+    static func corrected(_ heard: String, to corrected: String, otherHearing: String = "") {
         guard isEnabled else { return }
-        FileHandle.standardError.write(Data("[filter] corrected: 「\(heard)」 → 「\(corrected)」\n".utf8))
+        let hint = otherHearing.isEmpty ? "" : " (Apple heard 「\(otherHearing)」)"
+        FileHandle.standardError.write(Data("[filter] corrected: 「\(heard)」 → 「\(corrected)」\(hint)\n".utf8))
     }
 
     /// A correction thrown away because it doesn't sound like what was heard.

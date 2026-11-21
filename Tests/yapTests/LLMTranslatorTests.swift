@@ -43,6 +43,12 @@ import Testing
         _ = try Listen.parse(["--engine", "whisper", "--correct", "-l", "ja-JP"])
     }
 
+    @Test func otherHearingIsSentOnlyWhenItDiffers() {
+        #expect(LLMTranslator.differs("拘置所や刑務所ではなく", from: "公地所や刑務所ではなく"))
+        #expect(!LLMTranslator.differs("拘置所や、刑務所ではなく。", from: "拘置所や刑務所ではなく"))
+        #expect(!LLMTranslator.differs("", from: "拘置所"))
+    }
+
     @Test func environmentWinsOverDotEnv() {
         let values = DotEnv.load(environment: ["OPENCODE_MODEL": "other-model", "EMPTY": ""])
         #expect(values["OPENCODE_MODEL"] == "other-model")

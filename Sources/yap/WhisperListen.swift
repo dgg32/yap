@@ -426,6 +426,15 @@ final class CaptionOutput {
     private let noteWait: Duration = .seconds(1)
     /// Text lines ended so far, to tell when a line's notes arrive after a later line has ended.
     private var endedLines = 0
+    /// Apple's text for the audio since the last text line ended, the --correct hint for that line.
+    /// It's collected per commit, so a line that ends partway through a commit shares that commit's
+    /// text with the next line; the LLM is told the hint may cover a little more or less.
+    private var appleSinceLineEnd = ""
+
+    private func takeAppleSinceLineEnd(keeping rest: String) -> String {
+        defer { appleSinceLineEnd = rest }
+        return appleSinceLineEnd
+    }
     /// Writes subtitle cues in order, each once its translation is ready, without holding up the captions.
     private var writing: Task<Void, Never>?
 
@@ -453,20 +462,30 @@ final class CaptionOutput {
     func commit(upTo time: Double, endsLine: Bool) async {
         let commitEnd = max(committedTime, time)
         var lines = pending
-        if let fallback = preview?.settle(pending.map(\.text).joined(), from: committedTime, to: commitEnd) {
-            DebugFilters.replaced(pending.map(\.text).joined(), with: fallback)
-            lines = [(fallback, committedTime, commitEnd)]
+        // What Apple's transcriber heard for this audio: a hint for --correct when the two disagree
+        var appleHeard = ""
+        if let settled = preview?.settle(pending.map(\.text).joined(), from: committedTime, to: commitEnd) {
+            appleHeard = settled.heard
+            if let fallback = settled.fallback {
+                DebugFilters.replaced(pending.map(\.text).joined(), with: fallback)
+                lines = [(fallback, committedTime, commitEnd)]
+                // The line is Apple's text already, so there's nothing to compare it with
+                appleHeard = ""
+            }
         }
+        appleSinceLineEnd += appleHeard
         pending = []
         committedTime = commitEnd
         // One deadline for the whole commit, which can end several lines
         let noteDeadline = ContinuousClock.now + noteWait
         for (index, line) in lines.enumerated() {
-            await write(line.text, start: line.start, end: line.end, endsLine: endsLine && index == lines.count - 1, noteDeadline: noteDeadline)
+            let isLast = index == lines.count - 1
+            await write(line.text, start: line.start, end: line.end, endsLine: endsLine && isLast, noteDeadline: noteDeadline,
+                        appleHeard: appleHeard, isLastOfCommit: isLast)
         }
         if endsLine, lines.isEmpty, line.openWidth > 0 {
             await waitForNote(until: noteDeadline)
-            if let ended = line.endLine() { printNotes(for: ended) }
+            if let ended = line.endLine() { printNotes(for: ended, appleHeard: takeAppleSinceLineEnd(keeping: "")) }
         }
         render()
     }
@@ -484,7 +503,7 @@ final class CaptionOutput {
     /// line, and a corrected line is printed (green) above it. Notes that arrive after a later line
     /// has ended are headed by the start of their own line (dimmed), so they aren't read as the later
     /// line's.
-    private func printNotes(for text: String) {
+    private func printNotes(for text: String, appleHeard: String) {
         endedLines += 1
         let index = endedLines
         let translator = translator
@@ -506,7 +525,7 @@ final class CaptionOutput {
                 printNote(reading, color: 33)
             }
             guard let translator else { return }
-            let result = await translator.process(text)
+            let result = await translator.process(text, appleHeard: appleHeard)
             if result.text != text {
                 printNote("✎ \(result.text)", color: 32)
             }
@@ -541,7 +560,7 @@ final class CaptionOutput {
             line.clear()
             await note?.value
             if let ended = line.endLine() {
-                printNotes(for: ended)
+                printNotes(for: ended, appleHeard: takeAppleSinceLineEnd(keeping: ""))
                 await note?.value
             }
             print()
@@ -554,30 +573,35 @@ final class CaptionOutput {
         }
     }
 
-    private func write(_ text: String, start: Double, end: Double, endsLine: Bool, noteDeadline: ContinuousClock.Instant) async {
+    private func write(
+        _ text: String, start: Double, end: Double, endsLine: Bool, noteDeadline: ContinuousClock.Instant,
+        appleHeard: String, isLastOfCommit: Bool
+    ) async {
         if format == .txt {
             let endsSentence = text.last.map { "。！？!?…".contains($0) } ?? false
             // 80 columns, not characters: a Japanese character takes two
             let endsLine = endsLine || endsSentence || line.openWidth + displayWidth(of: text) > 80
             if endsLine { await waitForNote(until: noteDeadline) }
             if let ended = line.appendFinal(text, endsLine: endsLine) {
-                printNotes(for: ended)
+                // Ending partway through the commit: the rest of its Apple text belongs to the next line too
+                printNotes(for: ended, appleHeard: takeAppleSinceLineEnd(keeping: isLastOfCommit ? "" : appleHeard))
             }
             return
         }
+        appleSinceLineEnd = ""
         let previous = writing
         writing = Task {
             await previous?.value
-            await writeCues(text, start: start, end: end)
+            await writeCues(text, start: start, end: end, appleHeard: appleHeard)
         }
     }
 
-    private func writeCues(_ heard: String, start: Double, end: Double) async {
+    private func writeCues(_ heard: String, start: Double, end: Double, appleHeard: String) async {
         // Correct and translate the whole line, then split it into cues and share the translation out over them
         var text = heard
         var translation: String?
         if let translator {
-            let result = await translator.process(heard)
+            let result = await translator.process(heard, appleHeard: appleHeard)
             text = result.text
             translation = result.translation
         }
@@ -875,13 +899,14 @@ final class ApplePreview: @unchecked Sendable {
     }
 
     /// Hides the preview words for audio between `start` and `end`, which Whisper turned into `whisperText`.
-    /// Returns the preview's own text for that audio when Whisper's text is missing most of it.
+    /// Returns the preview's text for that audio (`heard`), and the same text as `fallback` when
+    /// Whisper's text is missing most of it.
     ///
     /// Final Apple results have per-character times, so they're cut by time. Volatile results carry a
     /// single time range for the whole text, so the cut is found by counting characters instead:
     /// both transcribers write roughly the same number of characters, ignoring punctuation. When
     /// Whisper's text can't be trusted for that, the cut is estimated from the time range.
-    func settle(_ whisperText: String, from start: Double, to end: Double) -> String? {
+    func settle(_ whisperText: String, from start: Double, to end: Double) -> (heard: String, fallback: String?) {
         lock.withLock {
             func letters(_ text: String) -> Int { text.filter { !Self.isPunctuation($0) }.count }
 
@@ -904,6 +929,7 @@ final class ApplePreview: @unchecked Sendable {
                     : max(volatileConsumed, Self.cutIndex(in: characters, at: (end - rangeStart) / (rangeEnd - rangeStart)))
             }
             let previewText = finalsText + String(characters[volatileConsumed..<estimatedCut])
+            let heard = previewText.trimmingCharacters(in: .whitespacesAndNewlines)
 
             // Even two characters (はい, そう) are a complete reply, but filler alone (ん, っ) is not
             let previewLetters = letters(previewText)
@@ -916,7 +942,7 @@ final class ApplePreview: @unchecked Sendable {
             if previewLetters >= 2, !previewContent.allSatisfy(WhisperFilter.fillerCharacters.contains),
                letters(whisperText) * 2 < previewLetters || wrongScript {
                 volatileConsumed = estimatedCut
-                return previewText.trimmingCharacters(in: .whitespacesAndNewlines)
+                return (heard, heard)
             }
 
             if estimatedCut == characters.count || estimatedCut == volatileConsumed {
@@ -953,7 +979,7 @@ final class ApplePreview: @unchecked Sendable {
                 }
                 volatileConsumed = index
             }
-            return nil
+            return (heard, nil)
         }
     }
 

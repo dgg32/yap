@@ -73,6 +73,8 @@ final class LLMTranslator {
             let correction = """
             "corrected": the line with recognition errors fixed. Only change a word when it is very likely \
             misheard: the fix must be read exactly the same (a homophone in different kanji), and fit the context clearly better. \
+            When a second recognizer's text is given, it is strong evidence: where the two write the same \
+            sound in different kanji, prefer the one that fits the context. \
             Check every word: one line can have several such errors, and a fix found in one place often \
             applies to the same sound elsewhere in the line or the earlier lines. Keep everything else exactly as it is: wording, numbers, punctuation and kana/kanji spelling. \
             If unsure, leave the word as it is.
@@ -110,10 +112,13 @@ final class LLMTranslator {
 
     /// Corrects and/or translates `text`. The line goes into the context of the next requests even
     /// when this one fails (as heard), so the context stays in step with the captions.
-    func process(_ text: String) async throws -> Reply {
+    ///
+    /// `otherHearing` is another recognizer's text for about the same audio (Apple's, when the preview
+    /// runs). With `corrects`, it's sent along when it differs from `text`.
+    func process(_ text: String, otherHearing: String = "") async throws -> Reply {
         let reply: Reply
         do {
-            reply = try await request(text)
+            reply = try await request(text, otherHearing: otherHearing)
         } catch {
             remember(text, translation: nil)
             throw error
@@ -127,7 +132,7 @@ final class LLMTranslator {
         if history.count > Self.contextLines { history.removeFirst() }
     }
 
-    private func request(_ text: String) async throws -> Reply {
+    private func request(_ text: String, otherHearing: String) async throws -> Reply {
         var user = ""
         if !history.isEmpty {
             user += "Earlier lines, for context only:\n"
@@ -138,6 +143,9 @@ final class LLMTranslator {
             user += "\n"
         }
         user += corrects ? "New line:\n\(text)" : "New line to translate:\n\(text)"
+        if corrects, Self.differs(otherHearing, from: text) {
+            user += "\n\nA second recognizer heard about the same audio (it may cover a little more or less) as:\n\(otherHearing)"
+        }
 
         var body: [String: Any] = [
             "model": config.model,
@@ -179,7 +187,7 @@ final class LLMTranslator {
             if let corrected = fields["corrected"].map(Self.clean), !corrected.isEmpty, corrected != text {
                 if Self.soundsAlike(text, corrected) {
                     reply.corrected = corrected
-                    DebugFilters.corrected(text, to: corrected)
+                    DebugFilters.corrected(text, to: corrected, otherHearing: Self.differs(otherHearing, from: text) ? otherHearing : "")
                 } else {
                     DebugFilters.correctionRejected(text, corrected)
                 }
@@ -190,6 +198,14 @@ final class LLMTranslator {
             reply.translation = translation.isEmpty ? nil : translation
         }
         return reply
+    }
+
+    /// Whether the other recognizer's text is worth sending: present, and not the same once punctuation
+    /// and spaces are ignored.
+    nonisolated static func differs(_ other: String, from text: String) -> Bool {
+        func letters(_ s: String) -> String { String(s.filter { $0.isLetter || $0.isNumber }) }
+        let other = letters(other)
+        return !other.isEmpty && other != letters(text)
     }
 
     /// The string fields of the JSON object in `reply`, which may be wrapped in a code fence or a

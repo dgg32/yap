@@ -245,12 +245,12 @@ With `--engine whisper`, `--translate <language>` translates each finished line 
 
 #### Correcting misheard words
 
-Whisper often writes the right sound in the wrong kanji: 構成 for 更生, 公地所 for 拘置所, 借り立てた for 駆り立てた. With `--correct`, the LLM (set up as for `--translator llm` above) gets each final line with the four before it and fixes such words from context. With `--translate`, the same request also translates the corrected line, so it adds no extra wait.
+Whisper often writes the right sound in the wrong kanji: 構成 for 更生, 公地所 for 拘置所, 借り立てた for 駆り立てた. With `--correct`, the LLM (set up as for `--translator llm` above) gets each final line with the four before it and fixes such words from context. It also gets what Apple's transcriber heard for the same audio (the grey text on the terminal) when that differs. The two recognizers often write the same sound in different kanji, and where Apple's version fits better, the LLM takes it: in a test passage, Whisper's 公地所 became Apple's 拘置所 in 3 runs of 3. This needs the preview, which is on by default (not `--no-preview`). With `--translate`, the same request also translates the corrected line, so it adds no extra wait.
 
-- **Only homophones:** a correction is kept only if it reads exactly the same in hiragana as what Whisper heard. Without that check, the model sometimes "fixed" a correct word into a plausible wrong one that differs by one sound (公正 → 公平). As a result, words Whisper heard as a different sound, or a line split across cues (すみ / ません), stay as they are.
+- **Only homophones:** a correction is kept only if it reads exactly the same in hiragana as what Whisper heard. Without that check, the model sometimes "fixed" a correct word into a plausible wrong one that differs by one sound (公正 → 公平). As a result, words Whisper heard as a different sound (パオハラ for パワハラ), or a line split across cues (すみ / ません), stay as they are.
 - **Text output:** the line is printed as heard, and the corrected line appears in green under it with ✎, followed by the reading and the translation. **SRT, VTT, JSON:** the corrected text replaces the heard text.
 - **Context only looks back:** the model sees earlier lines, not later ones, so an error in the first line of a topic often stays (公正主義, before anything says the topic is rehabilitation). A `--vocabulary` file fixes such terms in Whisper itself.
-- **Reviewing:** `YAP_DEBUG_FILTERS=1` logs every correction kept and every one refused, with the line before and after.
+- **Reviewing:** `YAP_DEBUG_FILTERS=1` logs every correction kept and every one refused, with the line before and after and what Apple heard.
 
 #### Readings
 

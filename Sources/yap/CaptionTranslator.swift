@@ -92,10 +92,13 @@ final class CaptionTranslator {
     /// `text`, corrected with --correct, and its translation, or nil if it couldn't be translated or
     /// came back empty (which would add an empty line to a subtitle cue). The first failure is reported
     /// on stderr, so a translation that stops working isn't silent.
-    func process(_ text: String) async -> Result {
+    ///
+    /// `appleHeard` is what Apple's transcriber heard for about the same audio. With --correct it
+    /// goes to the LLM as evidence for the right kanji.
+    func process(_ text: String, appleHeard: String = "") async -> Result {
         if let llm {
             do {
-                let reply = try await llm.process(text)
+                let reply = try await llm.process(text, otherHearing: appleHeard)
                 let corrected = reply.corrected ?? text
                 // Without a translation the LLM was only asked to correct, or the translation came back empty
                 if reply.translation != nil || session == nil {
